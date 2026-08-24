@@ -8,6 +8,7 @@ import json
 import os
 import posixpath
 import re
+from collections.abc import Awaitable
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
 
@@ -489,7 +490,10 @@ class DockerRunner(LocalRunner):
         effective_user = self._effective_user(target)
         container_name = self._container_name(paths)
 
-        command = [target.engine, "run", "--rm", "--name", container_name]
+        # Keep the stopped container inspectable until ``execute``'s finalizer.
+        # The daemon state is an authoritative fallback when the foreground
+        # Docker client remains attached after the container has exited.
+        command = [target.engine, "run", "--name", container_name]
         if prepared.stdin is not None:
             command.append("--interactive")
         if target.privileged:
@@ -594,6 +598,71 @@ class DockerRunner(LocalRunner):
                 process.kill()
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(process.wait(), timeout=1)
+
+    async def _inspect_container_state(
+        self, engine: str, container_name: str
+    ) -> dict[str, object] | None:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                engine,
+                "inspect",
+                "--format",
+                "{{json .State}}",
+                container_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.DEVNULL,
+            )
+        except (OSError, ValueError):
+            return None
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=3)
+        except asyncio.CancelledError:
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=1)
+            raise
+        except asyncio.TimeoutError:
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=1)
+            return None
+        if process.returncode != 0:
+            return None
+        try:
+            state = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return state if isinstance(state, dict) else None
+
+    async def _wait_for_container_exit(
+        self, engine: str, container_name: str
+    ) -> int:
+        while True:
+            state = await self._inspect_container_state(engine, container_name)
+            if state is not None and state.get("Status") in {"exited", "dead"}:
+                exit_code = state.get("ExitCode")
+                if (
+                    isinstance(exit_code, int)
+                    and not isinstance(exit_code, bool)
+                    and 0 <= exit_code <= 255
+                ):
+                    return exit_code
+                return 125
+            await asyncio.sleep(0.25)
+
+    def _external_completion(
+        self,
+        node: NodeSpec,
+        prepared: PreparedExecution,
+        paths: ExecutionPaths,
+    ) -> Awaitable[int]:
+        target = self._target(node)
+        return self._wait_for_container_exit(
+            target.engine, self._container_name(paths)
+        )
 
     async def execute(
         self,

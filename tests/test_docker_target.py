@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -238,7 +240,8 @@ def test_docker_runner_plan_contains_structured_isolation_controls(tmp_path: Pat
     assert plan.kind == "docker"
     assert plan.command is not None
     command = plan.command
-    assert command[:3] == ["docker", "run", "--rm"]
+    assert command[:2] == ["docker", "run"]
+    assert "--rm" not in command
     assert "--interactive" in command
     assert "--privileged" in command
     assert _option_values(command, "--network") == ["restricted-egress"]
@@ -763,3 +766,73 @@ def test_legacy_container_target_still_uses_container_runner(tmp_path: Path):
     assert plan.command is not None
     assert "--network" in plan.command
     assert plan.command[plan.command.index("--network") + 1] == "host"
+
+
+@pytest.mark.asyncio
+async def test_docker_runner_uses_container_exit_when_client_stalls(
+    tmp_path: Path, monkeypatch
+):
+    node = _node({"kind": "docker"})
+    node.timeout_seconds = 5
+    paths = _paths(tmp_path)
+    docker_prepared = PreparedExecution(
+        command=[sys.executable, "-c", "import time; time.sleep(10)"],
+        env={},
+        cwd=str(tmp_path),
+        trace_kind="python",
+    )
+    runner = DockerRunner()
+    removals: list[tuple[str, str]] = []
+    states: list[dict[str, object] | None] = [
+        None,
+        {"Status": "running", "ExitCode": 0},
+        {"Status": "exited", "ExitCode": 23},
+    ]
+
+    async def fake_remove(engine: str, container_name: str) -> None:
+        removals.append((engine, container_name))
+
+    async def fake_inspect(
+        _engine: str, _container_name: str
+    ) -> dict[str, object] | None:
+        return states.pop(0) if states else {"Status": "exited", "ExitCode": 23}
+
+    monkeypatch.setattr(runner, "_force_remove_container", fake_remove)
+    monkeypatch.setattr(runner, "_inspect_container_state", fake_inspect)
+    monkeypatch.setattr(
+        runner,
+        "_docker_prepared",
+        lambda _node, _prepared, _paths: (docker_prepared, [], {}),
+    )
+
+    output: list[tuple[str, str]] = []
+
+    async def on_output(stream: str, text: str) -> None:
+        output.append((stream, text))
+
+    started = time.monotonic()
+    result = await runner.execute(node, docker_prepared, paths, on_output, lambda: False)
+
+    assert time.monotonic() - started < 4
+    assert result.exit_code == 23
+    assert result.timed_out is False
+    assert result.cancelled is False
+    assert ("stderr", "Cancelled by user") not in output
+    assert len(removals) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [None, False, "0", -1, 256])
+async def test_docker_runner_fails_closed_for_invalid_container_exit_code(
+    monkeypatch, exit_code: object
+):
+    runner = DockerRunner()
+
+    async def fake_inspect(
+        _engine: str, _container_name: str
+    ) -> dict[str, object]:
+        return {"Status": "exited", "ExitCode": exit_code}
+
+    monkeypatch.setattr(runner, "_inspect_container_state", fake_inspect)
+
+    assert await runner._wait_for_container_exit("docker", "agentflow-test") == 125
