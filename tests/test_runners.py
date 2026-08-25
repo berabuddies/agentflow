@@ -639,6 +639,37 @@ async def test_local_runner_timeout_uses_standard_exit_code(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_local_runner_termination_closes_subprocess_transport():
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self._transport = FakeTransport()
+            self.terminated = False
+            self.killed = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = FakeProcess()
+    wait_task = asyncio.create_task(asyncio.sleep(0, result=0))
+
+    await LocalRunner()._terminate_with_fallback(process, wait_task)
+
+    assert process.terminated is True
+    assert process.killed is False
+    assert process._transport.closed is True
+
+
+@pytest.mark.asyncio
 async def test_local_runner_stdin_none_does_not_inherit_outer_pipe(tmp_path: Path):
     outer_script = textwrap.dedent(
         """
