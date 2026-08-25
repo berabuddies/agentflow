@@ -4,10 +4,12 @@ import asyncio
 import json
 import os
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agentflow.app import create_app
 from agentflow.orchestrator import Orchestrator
+from agentflow.specs import RunRecord
 from agentflow.store import RunStore
 from tests.test_orchestrator import make_orchestrator
 
@@ -184,6 +186,65 @@ def test_api_validate_supports_pipeline_path_payload_when_explicitly_enabled(tmp
     assert payload["working_dir"] == str(pipeline_dir.resolve())
     assert payload["nodes"][0]["target"]["cwd"] == str((pipeline_dir / "task").resolve())
 
+
+
+def test_api_rejects_artifact_path_traversal(tmp_path):
+    orchestrator = make_orchestrator(tmp_path)
+    app = create_app(store=orchestrator.store, orchestrator=orchestrator)
+    client = TestClient(app)
+
+    outside_secret = tmp_path / "secret.txt"
+    outside_secret.write_text("outside-runs-secret", encoding="utf-8")
+
+    create = client.post(
+        "/api/runs",
+        json={"pipeline": {"name": "artifact", "working_dir": str(tmp_path), "nodes": [{"id": "alpha", "agent": "codex", "prompt": "artifact output"}]}},
+    )
+    run_id = create.json()["id"]
+    asyncio.run(orchestrator.wait(run_id, timeout=5))
+
+    sibling_run_file = client.get(f"/api/runs/{run_id}/artifacts/%2E%2E/run.json")
+    assert sibling_run_file.status_code == 400
+
+    outside_runs_file = client.get("/api/runs/%2E%2E/artifacts/%2E%2E/secret.txt")
+    assert outside_runs_file.status_code == 400
+
+
+async def test_store_create_run_rejects_invalid_run_id_atomically(tmp_path):
+    store = RunStore(tmp_path / "runs")
+    record = RunRecord(
+        id="../outside",
+        pipeline={"name": "p", "nodes": [{"id": "alpha", "agent": "codex", "prompt": "hi"}]},
+    )
+
+    with pytest.raises(ValueError, match="path segment"):
+        await store.create_run(record)
+
+    assert store.list_runs() == []
+    assert not (tmp_path / "outside").exists()
+
+
+async def test_store_rejects_artifact_write_path_traversal(tmp_path):
+    store = RunStore(tmp_path / "runs")
+    await store.create_run(
+        RunRecord(
+            id="run",
+            pipeline={"name": "p", "nodes": [{"id": "alpha", "agent": "codex", "prompt": "hi"}]},
+        )
+    )
+
+    with pytest.raises(ValueError, match="path segment"):
+        await store.write_artifact_text("run", "../../outside", "output.txt", "pwned")
+    assert not (tmp_path / "outside" / "output.txt").exists()
+
+
+async def test_store_rejects_artifact_read_path_traversal(tmp_path):
+    store = RunStore(tmp_path / "runs")
+    outside_secret = tmp_path / "secret.txt"
+    outside_secret.write_text("outside-runs-secret", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="path segment"):
+        store.read_artifact_text("..", "..", "secret.txt")
 
 
 def test_api_rejects_non_json_content_type(tmp_path):

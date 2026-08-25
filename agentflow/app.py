@@ -164,6 +164,8 @@ def create_app(*, store: RunStore | None = None, orchestrator: Orchestrator | No
     async def get_artifact(run_id: str, node_id: str, name: str) -> PlainTextResponse:
         try:
             content = app.state.store.read_artifact_text(run_id, node_id, name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid artifact path") from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="artifact not found") from exc
         return PlainTextResponse(content)

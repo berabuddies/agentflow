@@ -4,13 +4,23 @@ import json
 import queue
 import threading
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PurePath
 from uuid import uuid4
 
 from pydantic import ValidationError
 
 from agentflow.specs import RunEvent, RunRecord
 from agentflow.utils import ensure_dir
+
+
+def _safe_path_segment(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"invalid {label} path segment")
+    if value in {".", ".."} or "/" in value or "\\" in value:
+        raise ValueError(f"invalid {label} path segment")
+    if PurePath(value).name != value:
+        raise ValueError(f"invalid {label} path segment")
+    return value
 
 
 class RunStore:
@@ -42,6 +52,7 @@ class RunStore:
     async def create_run(self, record: RunRecord | None = None) -> RunRecord:
         if record is None:
             raise ValueError("create_run requires a RunRecord")
+        _safe_path_segment(record.id, "run_id")
         self._runs[record.id] = record
         await self.persist_run(record.id)
         return record
@@ -50,13 +61,13 @@ class RunStore:
         return uuid4().hex
 
     def run_dir(self, run_id: str) -> Path:
-        return ensure_dir(self.base_dir / run_id)
+        return ensure_dir(self.base_dir / _safe_path_segment(run_id, "run_id"))
 
     def node_artifact_dir(self, run_id: str, node_id: str) -> Path:
-        return ensure_dir(self.run_dir(run_id) / "artifacts" / node_id)
+        return ensure_dir(self.run_dir(run_id) / "artifacts" / _safe_path_segment(node_id, "node_id"))
 
     def artifact_path(self, run_id: str, node_id: str, name: str) -> Path:
-        return self.node_artifact_dir(run_id, node_id) / name
+        return self.node_artifact_dir(run_id, node_id) / _safe_path_segment(name, "artifact name")
 
     def cancel_request_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "cancel.requested"
