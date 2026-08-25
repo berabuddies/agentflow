@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from agentflow.defaults import bundled_template_path
 from agentflow.loader import load_pipeline_from_data, load_pipeline_from_path, load_pipeline_from_text
 from agentflow.orchestrator import Orchestrator
-from agentflow.specs import PipelineSpec
+from agentflow.specs import AgentKind, PipelineSpec
 from agentflow.store import RunStore
 
 
@@ -26,6 +26,18 @@ _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 
 def _api_pipeline_path_enabled() -> bool:
     return os.getenv("AGENTFLOW_API_ALLOW_PIPELINE_PATH", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _api_executable_agents_enabled() -> bool:
+    return os.getenv("AGENTFLOW_API_ALLOW_EXECUTABLE_AGENTS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _reject_web_api_executable_agents(pipeline: PipelineSpec) -> None:
+    if _api_executable_agents_enabled():
+        return
+    executable_agents = {AgentKind.PYTHON, AgentKind.SHELL}
+    if any(node.agent in executable_agents for node in pipeline.nodes):
+        raise HTTPException(status_code=403, detail="executable agents are disabled for the web API by default")
 
 
 def _require_json_request(request: Request) -> None:
@@ -116,6 +128,7 @@ def create_app(*, store: RunStore | None = None, orchestrator: Orchestrator | No
         _require_json_request(request)
         payload = await request.json()
         pipeline = _parse_pipeline_payload(payload, allow_pipeline_path=_api_pipeline_path_enabled())
+        _reject_web_api_executable_agents(pipeline)
         return JSONResponse({"ok": True, "pipeline": pipeline.model_dump(mode="json")})
 
     @app.post("/api/runs")
@@ -123,6 +136,7 @@ def create_app(*, store: RunStore | None = None, orchestrator: Orchestrator | No
         _require_json_request(request)
         payload = await request.json()
         pipeline = _parse_pipeline_payload(payload, allow_pipeline_path=_api_pipeline_path_enabled())
+        _reject_web_api_executable_agents(pipeline)
         run = await app.state.orchestrator.submit(pipeline)
         return JSONResponse(run.model_dump(mode="json"))
 

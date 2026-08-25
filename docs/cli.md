@@ -154,13 +154,17 @@ The web API only accepts `application/json` for `/api/runs` and `/api/runs/valid
 
 For safety, the browser-facing API also disables `pipeline_path` by default, so a request cannot cause AgentFlow to execute a local `.py` pipeline file just by naming its path.
 
-If you intentionally want to allow filesystem path loading from the local web API in a trusted environment, opt in explicitly:
+Inline `shell` and `python` utility agents are also disabled for web API requests by default, so a submitted pipeline cannot directly become local command execution through the browser/API control plane.
+
+If you intentionally want to allow filesystem path loading or inline executable utility agents from the local web API in a trusted environment, opt in explicitly:
 
 ```bash
-AGENTFLOW_API_ALLOW_PIPELINE_PATH=1 agentflow serve
+AGENTFLOW_API_ALLOW_PIPELINE_PATH=1 \
+AGENTFLOW_API_ALLOW_EXECUTABLE_AGENTS=1 \
+agentflow serve
 ```
 
-Treat that override as a trusted operator-only setting.
+Treat those overrides as trusted operator-only settings.
 
 ## Tuned Agents And Evolution
 

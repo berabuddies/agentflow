@@ -186,6 +186,51 @@ def test_api_validate_supports_pipeline_path_payload_when_explicitly_enabled(tmp
 
 
 
+def test_api_rejects_inline_executable_agents_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTFLOW_API_ALLOW_EXECUTABLE_AGENTS", raising=False)
+    orchestrator = make_orchestrator(tmp_path)
+    app = create_app(store=orchestrator.store, orchestrator=orchestrator)
+    client = TestClient(app)
+
+    payload = {
+        "pipeline": {
+            "name": "shell-rce",
+            "working_dir": str(tmp_path),
+            "nodes": [{"id": "shell", "agent": "shell", "prompt": "echo unsafe"}],
+        }
+    }
+
+    validate = client.post("/api/runs/validate", json=payload)
+    assert validate.status_code == 403
+    assert validate.json()["detail"] == "executable agents are disabled for the web API by default"
+
+    create = client.post("/api/runs", json=payload)
+    assert create.status_code == 403
+    assert create.json()["detail"] == "executable agents are disabled for the web API by default"
+
+
+def test_api_allows_inline_executable_agents_when_explicitly_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_API_ALLOW_EXECUTABLE_AGENTS", "1")
+    orchestrator = make_orchestrator(tmp_path)
+    app = create_app(store=orchestrator.store, orchestrator=orchestrator)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/runs/validate",
+        json={
+            "pipeline": {
+                "name": "python-opt-in",
+                "working_dir": str(tmp_path),
+                "nodes": [{"id": "py", "agent": "python", "prompt": "print('trusted')"}],
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["pipeline"]["nodes"][0]["agent"] == "python"
+
+
+
 def test_api_rejects_non_json_content_type(tmp_path):
     orchestrator = make_orchestrator(tmp_path)
     app = create_app(store=orchestrator.store, orchestrator=orchestrator)
