@@ -11,6 +11,26 @@ from agentflow.specs import NodeSpec, ProviderConfig, RepoInstructionsMode, Tool
 
 _PI_READ_ONLY_TOOLS = "read,grep,find,ls"
 _PI_READ_WRITE_TOOLS = "read,bash,edit,write,grep,find,ls"
+_MINIMAX_MODELS = [
+    {
+        "id": "MiniMax-M3",
+        "name": "MiniMax M3",
+        "reasoning": True,
+        # Pi's models.json schema currently supports text and image inputs, not video.
+        "input": ["text", "image"],
+        # Pi requires numeric rates; MiniMax does not publish a cache-write rate for M3.
+        "cost": {"input": 0.6, "output": 2.4, "cacheRead": 0.12, "cacheWrite": 0.0},
+        "contextWindow": 1_000_000,
+    },
+    {
+        "id": "MiniMax-M2.7",
+        "name": "MiniMax M2.7",
+        "reasoning": True,
+        "input": ["text"],
+        "cost": {"input": 0.3, "output": 1.2, "cacheRead": 0.06, "cacheWrite": 0.375},
+        "contextWindow": 204_800,
+    },
+]
 
 
 class PiAdapter(AgentAdapter):
@@ -99,7 +119,10 @@ class PiAdapter(AgentAdapter):
             entry["headers"] = dict(provider.headers)
             entry["authHeader"] = True
         model_id = self._extract_model_id(model, provider.name)
-        entry["models"] = [{"id": model_id}] if model_id else []
+        models = [dict(model_entry) for model_entry in _MINIMAX_MODELS] if provider.name == "minimax" else []
+        if model_id and not any(model_entry["id"] == model_id for model_entry in models):
+            models.append({"id": model_id})
+        entry["models"] = models
 
         payload = {"providers": {provider.name: entry}}
         return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"

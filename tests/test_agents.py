@@ -528,6 +528,81 @@ def test_pi_adapter_passes_provider_name_when_model_bare(tmp_path):
     assert prepared.command[provider_idx + 1] == "anthropic"
 
 
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("minimax", "https://api.minimax.io/v1"),
+        ("minimax-cn", "https://api.minimaxi.com/v1"),
+    ],
+)
+def test_pi_adapter_resolves_minimax_provider_alias_to_openai_endpoint(tmp_path, provider, base_url):
+    # The MiniMax aliases resolve to OpenAI-compatible chat-completions
+    # endpoint with a base_url, so the Pi adapter materializes a scoped
+    # models.json rather than passing `--provider minimax` to the CLI.
+    node = NodeSpec.model_validate(
+        {
+            "id": "scan",
+            "agent": "pi",
+            "prompt": "Scan",
+            "provider": provider,
+            "model": "minimax/MiniMax-M3",
+        }
+    )
+    prepared = PiAdapter().prepare(node, "Scan", _paths(tmp_path))
+
+    assert "--provider" not in prepared.command
+    assert "PI_CODING_AGENT_DIR" in prepared.env
+    models_rel = str(Path("pi-home") / "agent" / "models.json")
+    assert models_rel in prepared.runtime_files
+    parsed = json.loads(prepared.runtime_files[models_rel])
+    entry = parsed["providers"]["minimax"]
+    assert entry["baseUrl"] == base_url
+    assert entry["api"] == "openai-completions"
+    assert entry["apiKey"] == "MINIMAX_API_KEY"
+    assert entry["models"] == [
+        {
+            "id": "MiniMax-M3",
+            "name": "MiniMax M3",
+            "reasoning": True,
+            "input": ["text", "image"],
+            "cost": {"input": 0.6, "output": 2.4, "cacheRead": 0.12, "cacheWrite": 0.0},
+            "contextWindow": 1_000_000,
+        },
+        {
+            "id": "MiniMax-M2.7",
+            "name": "MiniMax M2.7",
+            "reasoning": True,
+            "input": ["text"],
+            "cost": {"input": 0.3, "output": 1.2, "cacheRead": 0.06, "cacheWrite": 0.375},
+            "contextWindow": 204_800,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("minimax", "https://api.minimax.io/anthropic"),
+        ("minimax-cn", "https://api.minimaxi.com/anthropic"),
+    ],
+)
+def test_claude_adapter_supports_minimax_provider_alias(tmp_path, monkeypatch, provider, base_url):
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-secret")
+    node = NodeSpec.model_validate(
+        {
+            "id": "review",
+            "agent": "claude",
+            "prompt": "Review",
+            "provider": provider,
+        }
+    )
+
+    prepared = ClaudeAdapter().prepare(node, "Review", _paths(tmp_path))
+
+    assert prepared.env["ANTHROPIC_BASE_URL"] == base_url
+    assert prepared.env["ANTHROPIC_API_KEY"] == "test-minimax-secret"
+
+
 def test_pi_adapter_materializes_scoped_models_json(tmp_path):
     node = NodeSpec.model_validate(
         {

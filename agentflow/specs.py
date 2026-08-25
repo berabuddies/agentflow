@@ -308,6 +308,32 @@ def resolve_provider(value: str | ProviderConfig | None, agent: str | AgentKind)
             "provider 'kimi' is not supported for codex nodes because Codex requires an "
             "OpenAI Responses API backend and Kimi's public endpoints do not expose /responses"
         )
+    if alias in {"minimax", "minimax-cn"}:
+        # MiniMax exposes an Anthropic-compatible endpoint (for Claude nodes) and an
+        # OpenAI-compatible chat-completions endpoint (for Pi nodes, which materialize a
+        # scoped models.json). Its OpenAI surface is chat completions, not /responses, so
+        # it cannot back Codex nodes.
+        china_region = alias == "minimax-cn"
+        if resolved_agent == AgentKind.CLAUDE:
+            return ProviderConfig(
+                name="minimax",
+                base_url=(
+                    "https://api.minimaxi.com/anthropic"
+                    if china_region
+                    else "https://api.minimax.io/anthropic"
+                ),
+                api_key_env="MINIMAX_API_KEY",
+            )
+        if resolved_agent == AgentKind.PI:
+            return ProviderConfig(
+                name="minimax",
+                base_url="https://api.minimaxi.com/v1" if china_region else "https://api.minimax.io/v1",
+                api_key_env="MINIMAX_API_KEY",
+            )
+        raise ValueError(
+            f"provider '{alias}' is only supported for `pi` and `claude` nodes; MiniMax's "
+            "OpenAI-compatible endpoints expose chat completions, not the Responses API Codex requires"
+        )
     return ProviderConfig(name=value)
 
 
