@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+from agentflow.loader import load_pipeline_from_data
 from agentflow.specs import PipelineSpec, RunRecord, normalize_agent_name
 from agentflow.store import RunStore
 from agentflow.utils import ensure_dir, json_dumps
@@ -19,6 +22,7 @@ OPTIMIZER_PROMPT_FILENAME = "optimizer-prompt.txt"
 OPTIMIZER_RESULT_FILENAME = "optimizer-result.json"
 OPTIMIZER_VALIDATION_FILENAME = "optimizer-validation.json"
 GRAPH_OPTIMIZER_MAX_ATTEMPTS = 3
+CHILD_PIPELINE_LOAD_TIMEOUT_SECONDS = 5.0
 
 
 def editable_pipeline_payload(pipeline: PipelineSpec) -> dict[str, Any]:
@@ -204,3 +208,45 @@ def write_validation_result(path: Path, *, ok: bool, error: str | None = None) -
     if error is not None:
         payload["error"] = error
     path.write_text(json_dumps(payload), encoding="utf-8")
+
+
+def load_child_pipeline_from_path(path: Path) -> PipelineSpec:
+    """Load optimizer-edited pipeline as a child-run shape (`optimizer=None`, `n_run=1`)."""
+
+    path = Path(path)
+    if path.suffix == ".py":
+        try:
+            result = subprocess.run(
+                [sys.executable, str(path)],
+                capture_output=True,
+                text=True,
+                cwd=str(path.parent),
+                timeout=CHILD_PIPELINE_LOAD_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            details: list[str] = []
+            if exc.stdout:
+                details.append(f"stdout:\n{exc.stdout.strip()}")
+            if exc.stderr:
+                details.append(f"stderr:\n{exc.stderr.strip()}")
+            rendered_details = "" if not details else "\n" + "\n\n".join(details)
+            raise ValueError(
+                f"pipeline script `{path}` timed out after {CHILD_PIPELINE_LOAD_TIMEOUT_SECONDS:.1f}s.{rendered_details}"
+            ) from exc
+        if result.returncode != 0:
+            raise ValueError(f"pipeline script `{path}` failed:\n{result.stderr.strip()}")
+        raw_text = result.stdout
+    else:
+        raw_text = path.read_text(encoding="utf-8")
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"optimized pipeline `{path}` did not produce JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"optimized pipeline `{path}` did not produce an object payload")
+
+    parsed["optimizer"] = None
+    parsed["n_run"] = 1
+    return load_pipeline_from_data(parsed, base_dir=path.parent)

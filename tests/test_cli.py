@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -266,6 +267,22 @@ def _completed_run(
         finished_at="2026-03-08T04:11:10+00:00",
         nodes=nodes or {},
         model_dump=lambda mode="json": {"id": run_id, "status": status},
+    )
+
+
+def _run_event(
+    event_type: str,
+    *,
+    timestamp: str,
+    node_id: str | None = None,
+    data: dict[str, object] | None = None,
+):
+    return SimpleNamespace(
+        timestamp=timestamp,
+        run_id="run-event",
+        type=event_type,
+        node_id=node_id,
+        data=data or {},
     )
 
 
@@ -3014,6 +3031,237 @@ def test_run_uses_runtime_env_vars(monkeypatch):
     assert captured["wait_timeout"] is None
 
 
+def test_run_detach_submits_without_waiting(monkeypatch):
+    captured: dict[str, object] = {}
+    fake_pipeline = SimpleNamespace(model_dump=lambda mode="json": {"name": "detached", "nodes": []})
+
+    def fake_load_pipeline(*args, **kwargs):
+        captured["load_args"] = args
+        return fake_pipeline
+
+    def fake_ensure_daemon(*args, **kwargs):
+        captured["ensure_args"] = args
+        captured["ensure_kwargs"] = kwargs
+        return "http://daemon.test"
+
+    def fake_submit(pipeline: object, base_url: str):
+        captured["submitted_pipeline"] = pipeline
+        captured["submitted_base_url"] = base_url
+        return SimpleNamespace(
+            id="run-detached",
+            status=SimpleNamespace(value="queued"),
+            pipeline=SimpleNamespace(name="detached"),
+            nodes={},
+            model_dump=lambda mode="json": {"id": "run-detached", "status": "queued"},
+        )
+
+    monkeypatch.setattr(agentflow.cli, "_load_pipeline_with_optional_smoke_preflight", fake_load_pipeline)
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_build_runtime",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("runtime should not build in detach mode")),
+    )
+    monkeypatch.setattr(agentflow.cli, "_ensure_daemon", fake_ensure_daemon)
+    monkeypatch.setattr(agentflow.cli, "_submit_detached_run", fake_submit)
+
+    result = runner.invoke(app, ["run", "pipeline.py", "-d", "--output", "summary"])
+
+    assert result.exit_code == 0
+    assert "Run run-detached: queued" in result.stdout
+    assert "completed" not in result.stdout
+    assert captured["submitted_pipeline"] is fake_pipeline
+    assert captured["submitted_base_url"] == "http://daemon.test"
+
+
+def test_run_detach_uses_daemon_env_overrides(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+    fake_pipeline = SimpleNamespace(model_dump=lambda mode="json": {"name": "env-detach", "nodes": []})
+    metadata_path = tmp_path / "daemon.json"
+    runs_dir = tmp_path / "runs"
+
+    monkeypatch.setenv("AGENTFLOW_DAEMON_METADATA_PATH", str(metadata_path))
+    monkeypatch.setenv("AGENTFLOW_DAEMON_HOST", "daemon-host")
+    monkeypatch.setenv("AGENTFLOW_DAEMON_PORT", "8123")
+
+    monkeypatch.setattr(agentflow.cli, "_load_pipeline_with_optional_smoke_preflight", lambda *args, **kwargs: fake_pipeline)
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_build_runtime",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("runtime should not build in detach mode")),
+    )
+
+    def fake_ensure_daemon(runs_dir_value: str, max_concurrent_runs: int, *, host: str, port: int, metadata_path: Path):
+        captured["runs_dir"] = runs_dir_value
+        captured["max_concurrent_runs"] = max_concurrent_runs
+        captured["host"] = host
+        captured["port"] = port
+        captured["metadata_path"] = metadata_path
+        return f"http://{host}:{port}"
+
+    def fake_submit(pipeline: object, base_url: str):
+        captured["submitted_base_url"] = base_url
+        return SimpleNamespace(
+            id="run-detached-env",
+            status=SimpleNamespace(value="running"),
+            pipeline=SimpleNamespace(name="env-detach"),
+            nodes={},
+            model_dump=lambda mode="json": {"id": "run-detached-env", "status": "running"},
+        )
+
+    monkeypatch.setattr(agentflow.cli, "_ensure_daemon", fake_ensure_daemon)
+    monkeypatch.setattr(agentflow.cli, "_submit_detached_run", fake_submit)
+
+    result = runner.invoke(app, ["run", "pipeline.py", "-d", "--runs-dir", str(runs_dir), "--output", "summary"])
+
+    assert result.exit_code == 0
+    assert captured["runs_dir"] == str(runs_dir)
+    assert captured["host"] == "daemon-host"
+    assert captured["port"] == 8123
+    assert captured["metadata_path"] == metadata_path
+    assert captured["submitted_base_url"] == "http://daemon-host:8123"
+
+
+def test_start_daemon_uses_explicit_host_and_port_flags(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 12345
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(agentflow.cli.subprocess, "Popen", fake_popen)
+
+    process = agentflow.cli._start_daemon(
+        host="127.0.0.1",
+        port=8123,
+        runs_dir="/tmp/agentflow-runs",
+        max_concurrent_runs=5,
+    )
+
+    assert process.pid == 12345
+    assert captured["command"] == [
+        sys.executable,
+        "-m",
+        "agentflow.cli",
+        "serve",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8123",
+    ]
+    assert captured["kwargs"]["start_new_session"] is True
+    assert captured["kwargs"]["env"]["AGENTFLOW_RUNS_DIR"] == "/tmp/agentflow-runs"
+    assert captured["kwargs"]["env"]["AGENTFLOW_MAX_CONCURRENT_RUNS"] == "5"
+
+
+def test_wait_for_daemon_prints_timeout_diagnostic(monkeypatch):
+    messages: list[tuple[str, bool]] = []
+    monotonic_values = iter([0.0, 0.0, 0.2])
+
+    monkeypatch.setattr(agentflow.cli, "_daemon_is_healthy", lambda base_url: False)
+    monkeypatch.setattr(agentflow.cli.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(agentflow.cli.time, "sleep", lambda _: None)
+    monkeypatch.setattr(agentflow.cli.typer, "echo", lambda message, err=False: messages.append((message, err)))
+
+    with pytest.raises(typer.Exit) as exc_info:
+        agentflow.cli._wait_for_daemon("http://127.0.0.1:8123", timeout_seconds=0.1)
+
+    assert exc_info.value.exit_code == 1
+    assert messages == [
+        (
+            "Timed out waiting for the daemon at http://127.0.0.1:8123 to become healthy. "
+            "Check whether that host/port is already in use, inspect daemon startup errors, "
+            "or try starting `agentflow serve` manually with the same --host/--port values.",
+            True,
+        )
+    ]
+
+
+def test_ensure_daemon_locks_startup_and_metadata_write(monkeypatch, tmp_path):
+    calls: list[str] = []
+
+    @contextmanager
+    def fake_lock(metadata_path: Path):
+        calls.append(f"enter:{metadata_path.name}")
+        try:
+            yield
+        finally:
+            calls.append("exit")
+
+    monkeypatch.setattr(agentflow.cli, "_daemon_startup_lock", fake_lock)
+    monkeypatch.setattr(agentflow.cli, "_load_daemon_metadata", lambda path: calls.append("load") or None)
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_start_daemon",
+        lambda **kwargs: calls.append("start") or SimpleNamespace(pid=12345),
+    )
+    monkeypatch.setattr(agentflow.cli, "_wait_for_daemon", lambda base_url: calls.append(f"wait:{base_url}"))
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_write_daemon_metadata",
+        lambda metadata_path, **kwargs: calls.append(f"write:{metadata_path.name}:{kwargs['pid']}"),
+    )
+
+    base_url = agentflow.cli._ensure_daemon(
+        "/tmp/agentflow-runs",
+        5,
+        host="127.0.0.1",
+        port=8123,
+        metadata_path=tmp_path / "daemon.json",
+    )
+
+    assert base_url == "http://127.0.0.1:8123"
+    assert calls == [
+        "enter:daemon.json",
+        "load",
+        "start",
+        "wait:http://127.0.0.1:8123",
+        "write:daemon.json:12345",
+        "exit",
+    ]
+
+
+def test_submit_detached_run_handles_request_error(monkeypatch):
+    messages: list[tuple[str, bool]] = []
+    fake_pipeline = SimpleNamespace(model_dump=lambda mode="json": {"name": "detached", "nodes": []})
+
+    def fake_post(*args, **kwargs):
+        raise agentflow.cli.httpx.RequestError("connection refused")
+
+    monkeypatch.setattr(agentflow.cli.httpx, "post", fake_post)
+    monkeypatch.setattr(agentflow.cli.typer, "echo", lambda message, err=False: messages.append((message, err)))
+
+    with pytest.raises(typer.Exit) as exc_info:
+        agentflow.cli._submit_detached_run(fake_pipeline, "http://daemon.test")
+
+    assert exc_info.value.exit_code == 1
+    assert messages == [("Failed to submit run to daemon at http://daemon.test: connection refused", True)]
+
+
+def test_submit_detached_run_handles_invalid_json(monkeypatch):
+    messages: list[tuple[str, bool]] = []
+    fake_pipeline = SimpleNamespace(model_dump=lambda mode="json": {"name": "detached", "nodes": []})
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> object:
+            raise ValueError("not json")
+
+    monkeypatch.setattr(agentflow.cli.httpx, "post", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(agentflow.cli.typer, "echo", lambda message, err=False: messages.append((message, err)))
+
+    with pytest.raises(typer.Exit) as exc_info:
+        agentflow.cli._submit_detached_run(fake_pipeline, "http://daemon.test")
+
+    assert exc_info.value.exit_code == 1
+    assert messages == [("Failed to submit run to daemon at http://daemon.test: invalid JSON response", True)]
+
+
 def test_run_defaults_to_summary_on_tty(monkeypatch):
     class FakeOrchestrator:
         async def submit(self, pipeline: object):
@@ -3324,6 +3572,417 @@ def test_show_exits_for_missing_run(monkeypatch):
 
     assert result.exit_code == 1
     assert "Run `missing-run` not found in `.agentflow/runs`." in result.stderr
+
+
+def test_status_command_exits_for_missing_run(monkeypatch):
+    def _missing(run_id: str):
+        raise KeyError(run_id)
+
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_build_store",
+        lambda runs_dir: SimpleNamespace(get_run=_missing),
+    )
+
+    result = runner.invoke(app, ["status", "missing-run"])
+
+    assert result.exit_code == 1
+    assert "Run `missing-run` not found in `.agentflow/runs`." in result.stderr
+
+
+def test_status_command_renders_summary_with_recent_events(monkeypatch):
+    record = _completed_run(
+        "run-status",
+        pipeline_name="status-pipeline",
+        status="running",
+        pipeline_nodes=[
+            SimpleNamespace(id="plan", agent=SimpleNamespace(value="codex")),
+            SimpleNamespace(id="review", agent=SimpleNamespace(value="claude")),
+        ],
+        nodes={
+            "plan": SimpleNamespace(
+                status=SimpleNamespace(value="running"),
+                current_attempt=2,
+                attempts=[SimpleNamespace(number=1), SimpleNamespace(number=2)],
+                stderr_lines=[],
+                stdout_lines=[],
+            ),
+            "review": SimpleNamespace(
+                status=SimpleNamespace(value="pending"),
+                current_attempt=0,
+                attempts=[],
+                stderr_lines=[],
+                stdout_lines=[],
+            ),
+        },
+    )
+    record.finished_at = None
+    events = [
+        _run_event("old_event", timestamp="2026-04-12T10:00:00+00:00"),
+        _run_event("node_started", timestamp="2026-04-12T10:00:01+00:00", node_id="plan"),
+        _run_event("node_retrying", timestamp="2026-04-12T10:00:02+00:00", node_id="plan", data={"attempt": 2}),
+        _run_event("node_trace", timestamp="2026-04-12T10:00:03+00:00", node_id="plan"),
+        _run_event("node_waiting", timestamp="2026-04-12T10:00:04+00:00", node_id="review"),
+        _run_event("node_skipped", timestamp="2026-04-12T10:00:05+00:00", node_id="review", data={"reason": "upstream_failure"}),
+    ]
+
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_build_store",
+        lambda runs_dir: SimpleNamespace(
+            get_run=lambda run_id: record,
+            get_events=lambda run_id: events,
+            run_dir=lambda run_id: Path(runs_dir) / run_id,
+        ),
+    )
+    monkeypatch.setattr(agentflow.cli, "_stream_supports_tty_summary", lambda *, err: True)
+
+    result = runner.invoke(app, ["status", "run-status"])
+
+    assert result.exit_code == 0
+    assert "Run run-status: running" in result.stdout
+    assert "Pipeline: status-pipeline" in result.stdout
+    assert "Progress: 1/2 nodes, active 1" in result.stdout
+    assert "Active: plan (running, attempt 2)" in result.stdout
+    assert "Recent events:" in result.stdout
+    assert "old_event" not in result.stdout
+    for event_type in ("node_started", "node_retrying", "node_trace", "node_waiting", "node_skipped"):
+        assert event_type in result.stdout
+
+
+def test_status_command_supports_json_summary_output(monkeypatch):
+    record = _completed_run(
+        "run-status-json",
+        pipeline_name="status-pipeline",
+        status="running",
+        pipeline_nodes=[
+            SimpleNamespace(id="plan", agent=SimpleNamespace(value="codex")),
+            SimpleNamespace(id="review", agent=SimpleNamespace(value="claude")),
+        ],
+        nodes={
+            "plan": SimpleNamespace(
+                status=SimpleNamespace(value="running"),
+                current_attempt=2,
+                attempts=[SimpleNamespace(number=1), SimpleNamespace(number=2)],
+                stderr_lines=[],
+                stdout_lines=[],
+            ),
+            "review": SimpleNamespace(
+                status=SimpleNamespace(value="pending"),
+                current_attempt=0,
+                attempts=[],
+                stderr_lines=[],
+                stdout_lines=[],
+            ),
+        },
+    )
+    record.finished_at = None
+    events = [
+        _run_event("run_started", timestamp="2026-04-12T10:00:01+00:00"),
+        _run_event("node_started", timestamp="2026-04-12T10:00:02+00:00", node_id="plan"),
+    ]
+
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_build_store",
+        lambda runs_dir: SimpleNamespace(
+            get_run=lambda run_id: record,
+            get_events=lambda run_id: events,
+            run_dir=lambda run_id: Path(runs_dir) / run_id,
+        ),
+    )
+
+    result = runner.invoke(app, ["status", "run-status-json", "--output", "json-summary"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["id"] == "run-status-json"
+    assert [event["type"] for event in payload["events"]] == ["run_started", "node_started"]
+    assert [event["type"] for event in payload["recent_events"]] == ["run_started", "node_started"]
+    assert payload["progress"] == {
+        "total_nodes": 2,
+        "progressed_nodes": 1,
+        "active_nodes": [{"id": "plan", "status": "running", "attempt": 2}],
+        "status_counts": {"running": 1, "pending": 1},
+        "progress_percent": 50.0,
+    }
+
+
+def test_status_command_renders_evolution_progress(monkeypatch):
+    record = _completed_run(
+        "run-status-evolve",
+        pipeline_name="status-pipeline",
+        status="running",
+        pipeline_nodes=[
+            SimpleNamespace(id="plan", agent=SimpleNamespace(value="codex")),
+            SimpleNamespace(id="evolve", agent=SimpleNamespace(value="python")),
+            SimpleNamespace(id="evolve_b", agent=SimpleNamespace(value="python")),
+        ],
+        nodes={
+            "plan": SimpleNamespace(
+                status=SimpleNamespace(value="completed"),
+                current_attempt=1,
+                attempts=[SimpleNamespace(number=1)],
+                stderr_lines=[],
+                stdout_lines=[],
+            ),
+            "evolve": SimpleNamespace(
+                status=SimpleNamespace(value="running"),
+                current_attempt=1,
+                attempts=[SimpleNamespace(number=1)],
+                stderr_lines=[
+                    "not-json",
+                    json.dumps({"agentflow_event": "evolution_progress", "stage": "start", "attempt": 1}),
+                    json.dumps(
+                        {
+                            "agentflow_event": "evolution_progress",
+                            "stage": "build",
+                            "attempt": 1,
+                            "status": "started",
+                            "command": "build",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "agentflow_event": "evolution_progress",
+                            "stage": "build",
+                            "attempt": 1,
+                            "status": "completed",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "agentflow_event": "evolution_progress",
+                            "stage": "final",
+                            "attempt": 1,
+                            "status": "success",
+                        }
+                    ),
+                ],
+                stdout_lines=[],
+            ),
+            "evolve_b": SimpleNamespace(
+                status=SimpleNamespace(value="running"),
+                current_attempt=1,
+                attempts=[SimpleNamespace(number=1)],
+                stderr_lines=[
+                    json.dumps(
+                        {
+                            "agentflow_event": "evolution_progress",
+                            "stage": "build",
+                            "attempt": 1,
+                            "status": "started",
+                            "command": "build-b",
+                        }
+                    )
+                ],
+                stdout_lines=[],
+            ),
+        },
+    )
+    record.finished_at = None
+    events = []
+
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_build_store",
+        lambda runs_dir: SimpleNamespace(
+            get_run=lambda run_id: record,
+            get_events=lambda run_id: events,
+            run_dir=lambda run_id: Path(runs_dir) / run_id,
+        ),
+    )
+    monkeypatch.setattr(agentflow.cli, "_stream_supports_tty_summary", lambda *, err: True)
+
+    result = runner.invoke(app, ["status", "run-status-evolve"])
+
+    assert result.exit_code == 0
+    assert "Evolution progress:" in result.stdout
+    assert "evolve: start (attempt 1)" in result.stdout
+    assert "evolve: build started (attempt 1, command=build)" in result.stdout
+    assert "evolve: build completed (attempt 1)" in result.stdout
+    assert "evolve: final success (attempt 1)" in result.stdout
+    assert "evolve_b: build started (attempt 1, command=build-b)" in result.stdout
+
+
+def test_status_command_returns_evolution_progress_json(monkeypatch):
+    record = _completed_run(
+        "run-status-evolve-json",
+        pipeline_name="status-pipeline",
+        status="running",
+        pipeline_nodes=[
+            SimpleNamespace(id="plan", agent=SimpleNamespace(value="codex")),
+            SimpleNamespace(id="evolve", agent=SimpleNamespace(value="python")),
+        ],
+        nodes={
+            "plan": SimpleNamespace(
+                status=SimpleNamespace(value="completed"),
+                current_attempt=1,
+                attempts=[SimpleNamespace(number=1)],
+                stderr_lines=[],
+                stdout_lines=[],
+            ),
+            "evolve": SimpleNamespace(
+                status=SimpleNamespace(value="running"),
+                current_attempt=1,
+                attempts=[SimpleNamespace(number=1)],
+                stderr_lines=[
+                    json.dumps({"agentflow_event": "evolution_progress", "stage": "start", "attempt": 1}),
+                    "plain text",
+                    json.dumps(
+                        {
+                            "agentflow_event": "evolution_progress",
+                            "stage": "build",
+                            "attempt": 1,
+                            "status": "started",
+                            "command": "build",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "agentflow_event": "evolution_progress",
+                            "stage": "build",
+                            "attempt": 1,
+                            "status": "failed",
+                            "detail": "exit 1",
+                        }
+                    ),
+                ],
+                stdout_lines=[],
+            ),
+        },
+    )
+    record.finished_at = None
+
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_build_store",
+        lambda runs_dir: SimpleNamespace(
+            get_run=lambda run_id: record,
+            get_events=lambda run_id: [],
+            run_dir=lambda run_id: Path(runs_dir) / run_id,
+        ),
+    )
+
+    result = runner.invoke(app, ["status", "run-status-evolve-json", "--output", "json-summary"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["evolution_progress"] == [
+        {
+            "agentflow_event": "evolution_progress",
+            "stage": "start",
+            "attempt": 1,
+            "node_id": "evolve",
+        },
+        {
+            "agentflow_event": "evolution_progress",
+            "stage": "build",
+            "attempt": 1,
+            "status": "started",
+            "command": "build",
+            "node_id": "evolve",
+        },
+        {
+            "agentflow_event": "evolution_progress",
+            "stage": "build",
+            "attempt": 1,
+            "status": "failed",
+            "detail": "exit 1",
+            "node_id": "evolve",
+        },
+    ]
+
+
+def test_status_command_uses_live_node_trace_for_evolution_progress(monkeypatch):
+    record = _completed_run(
+        "run-status-evolve-live",
+        pipeline_name="status-pipeline",
+        status="running",
+        pipeline_nodes=[
+            SimpleNamespace(id="evolve", agent=SimpleNamespace(value="python")),
+        ],
+        nodes={
+            "evolve": SimpleNamespace(
+                status=SimpleNamespace(value="pending"),
+                current_attempt=1,
+                attempts=[SimpleNamespace(number=1)],
+                stderr_lines=[],
+                stdout_lines=[],
+            ),
+        },
+    )
+    record.finished_at = None
+    live_events = [
+        _run_event(
+            "node_trace",
+            timestamp="2026-04-12T10:00:02+00:00",
+            node_id="evolve",
+            data={
+                "trace": {
+                    "source": "stderr",
+                    "content": json.dumps(
+                        {
+                            "agentflow_event": "evolution_progress",
+                            "stage": "optimizer",
+                            "attempt": 1,
+                            "status": "started",
+                            "command": "optimizer",
+                        }
+                    ),
+                }
+            },
+        )
+    ]
+
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_build_store",
+        lambda runs_dir: SimpleNamespace(
+            get_run=lambda run_id: record,
+            get_events=lambda run_id: live_events,
+            run_dir=lambda run_id: Path(runs_dir) / run_id,
+        ),
+    )
+    monkeypatch.setattr(agentflow.cli, "_stream_supports_tty_summary", lambda *, err: True)
+
+    result = runner.invoke(app, ["status", "run-status-evolve-live"])
+
+    assert result.exit_code == 0
+    assert "Evolution progress:" in result.stdout
+    assert "evolve: optimizer started (attempt 1, command=optimizer)" in result.stdout
+
+
+def test_status_command_shows_optimization_session(monkeypatch):
+    record = _completed_run(
+        "run-status-opt",
+        pipeline_name="status-pipeline",
+        status="running",
+    )
+    record.finished_at = None
+    record.optimization_session = {
+        "kind": "graph",
+        "optimizer": "codex",
+        "total_rounds": 3,
+        "current_round": 2,
+        "child_run_ids": ["child-1", "child-2"],
+    }
+
+    monkeypatch.setattr(
+        agentflow.cli,
+        "_build_store",
+        lambda runs_dir: SimpleNamespace(
+            get_run=lambda run_id: record,
+            get_events=lambda run_id: [],
+            run_dir=lambda run_id: Path(runs_dir) / run_id,
+        ),
+    )
+    monkeypatch.setattr(agentflow.cli, "_stream_supports_tty_summary", lambda *, err: True)
+
+    result = runner.invoke(app, ["status", "run-status-opt"])
+
+    assert result.exit_code == 0
+    assert "Optimization: graph optimizer=codex round 2/3 child_runs=2" in result.stdout
 
 
 def test_cancel_outputs_summary_for_existing_run(monkeypatch):

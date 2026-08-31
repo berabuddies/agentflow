@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 import yaml
@@ -641,7 +641,10 @@ def _write_failure_metadata(
     _write_json(version_dir / "version.json", failed_version.model_dump(mode="json"))
 
 
-def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def run_evolution_from_payload(
+    payload: dict[str, Any],
+    progress: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, Any]:
     request = EvolutionRequest.model_validate(payload)
     workspace = Path(request.workspace_dir or os.getcwd()).expanduser().resolve()
     resolved_config = load_tuner_config(workspace, request.profile)
@@ -658,6 +661,29 @@ def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
     if not request.source_nodes:
         raise ValueError("evolution requires at least one source node")
+
+    def _emit_progress(
+        stage: str,
+        *,
+        attempt: int,
+        status: str | None = None,
+        command: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        if progress is None:
+            return
+        payload: dict[str, object] = {
+            "agentflow_event": "evolution_progress",
+            "stage": stage,
+            "attempt": attempt,
+        }
+        if status is not None:
+            payload["status"] = status
+        if command is not None:
+            payload["command"] = command
+        if detail is not None:
+            payload["detail"] = detail
+        progress(payload)
 
     version_id = uuid4().hex[:12]
     version_dir = tuned_agent_version_dir(workspace, resolved_config.agent_name, version_id)
@@ -680,8 +706,11 @@ def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     resolved_executable = _resolved_executable_path(resolved_config.config, repo_workdir)
     failure_summary: str | None = None
 
+    _emit_progress("start", attempt=1)
+
     for attempt_number in range(1, resolved_config.config.max_attempts + 1):
         attempt_dir = ensure_dir(attempt_root / f"attempt-{attempt_number}")
+        _emit_progress("attempt", attempt=attempt_number, status="started")
         prompt = _optimizer_prompt(
             resolved_config,
             repo_root=repo_dir,
@@ -692,6 +721,7 @@ def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
         _write_text(attempt_dir / "optimizer-prompt.txt", prompt)
 
+        _emit_progress("optimizer", attempt=attempt_number, status="started", command="optimizer")
         optimizer_result = _run_optimizer(
             optimizer_kind,
             prompt=prompt,
@@ -702,8 +732,16 @@ def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _write_attempt_artifact(attempt_dir, "optimizer", optimizer_result)
         if optimizer_result.exit_code != 0:
             failure_summary = _attempt_summary("Optimizer", optimizer_result)
+            _emit_progress("optimizer", attempt=attempt_number, status="failed", detail=failure_summary)
             continue
+        _emit_progress("optimizer", attempt=attempt_number, status="completed")
 
+        _emit_progress(
+            "build",
+            attempt=attempt_number,
+            status="started",
+            command=resolved_config.config.build_command,
+        )
         build_result = _run_shell_command(
             resolved_config.config.build_command,
             repo_dir=repo_workdir,
@@ -715,8 +753,16 @@ def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _write_attempt_artifact(attempt_dir, "build", build_result)
         if build_result.exit_code != 0:
             failure_summary = _attempt_summary("Build", build_result)
+            _emit_progress("build", attempt=attempt_number, status="failed", detail=failure_summary)
             continue
+        _emit_progress("build", attempt=attempt_number, status="completed")
 
+        _emit_progress(
+            "test",
+            attempt=attempt_number,
+            status="started",
+            command=resolved_config.config.test_command,
+        )
         test_result = _run_shell_command(
             resolved_config.config.test_command,
             repo_dir=repo_workdir,
@@ -728,8 +774,16 @@ def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _write_attempt_artifact(attempt_dir, "test", test_result)
         if test_result.exit_code != 0:
             failure_summary = _attempt_summary("Test", test_result)
+            _emit_progress("test", attempt=attempt_number, status="failed", detail=failure_summary)
             continue
+        _emit_progress("test", attempt=attempt_number, status="completed")
 
+        _emit_progress(
+            "smoke",
+            attempt=attempt_number,
+            status="started",
+            command=resolved_config.config.smoke_command,
+        )
         smoke_result = _run_shell_command(
             resolved_config.config.smoke_command,
             repo_dir=repo_workdir,
@@ -741,13 +795,19 @@ def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _write_attempt_artifact(attempt_dir, "smoke", smoke_result)
         if smoke_result.exit_code != 0:
             failure_summary = _attempt_summary("Smoke", smoke_result)
+            _emit_progress("smoke", attempt=attempt_number, status="failed", detail=failure_summary)
             continue
+        _emit_progress("smoke", attempt=attempt_number, status="completed")
 
         executable_path = Path(resolved_executable)
         if not executable_path.exists():
-            raise FileNotFoundError(
+            detail = (
                 f"successful evolution did not produce executable `{executable_path}`; "
                 "set `executable_path` in the tuner config or make the build produce the default path"
+            )
+            _emit_progress("final", attempt=attempt_number, status="failed", detail=detail)
+            raise FileNotFoundError(
+                detail
             )
 
         version = TunedAgentVersion(
@@ -764,6 +824,7 @@ def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
             summary=_parse_agent_output(optimizer_kind, f"optimizer_{version_id}", optimizer_result.stdout),
         )
         register_tuned_agent_version(workspace, version)
+        _emit_progress("final", attempt=attempt_number, status="success")
         return {
             "ok": True,
             "agent_name": version.agent_name,
@@ -775,6 +836,12 @@ def run_evolution_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "traces": copied_traces,
         }
 
+    _emit_progress(
+        "final",
+        attempt=resolved_config.config.max_attempts,
+        status="failed",
+        detail=failure_summary or "evolution failed without diagnostics",
+    )
     _write_failure_metadata(
         version_dir,
         agent_name=resolved_config.agent_name,

@@ -31,12 +31,12 @@ from agentflow.graph_optimizer import (
     OPTIMIZER_VALIDATION_FILENAME,
     build_graph_report,
     copy_run_traces,
+    load_child_pipeline_from_path,
     render_graph_optimizer_prompt,
     write_editable_pipeline_python,
     write_optimizer_result,
     write_validation_result,
 )
-from agentflow.loader import load_pipeline_from_path
 from agentflow.prepared import ExecutionPaths, PreparedExecution, build_execution_paths
 from agentflow.runners.registry import RunnerRegistry, default_runner_registry
 from agentflow.specs import (
@@ -532,7 +532,7 @@ class Orchestrator:
                     write_validation_result(round_dir / OPTIMIZER_VALIDATION_FILENAME, ok=False, error=failure_summary)
                 else:
                     try:
-                        loaded_pipeline = load_pipeline_from_path(pipeline_path)
+                        loaded_pipeline = load_child_pipeline_from_path(pipeline_path)
                     except Exception as exc:
                         failure_summary = _optimizer_failure_summary(
                             "Optimized pipeline",

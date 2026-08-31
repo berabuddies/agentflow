@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .agentflow/
 reference/
+docs/superpowers/
 node_modules/
 playwright-report/
 test-results/
@@ -11,4 +12,3 @@ test-results/
 dist/
 *.egg-info/
 .worktrees/
-docs/superpowers/

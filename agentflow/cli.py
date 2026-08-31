@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import os
+from contextlib import contextmanager
 import json
+import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 try:
@@ -16,9 +18,15 @@ except ImportError:  # pragma: no cover - Python < 3.11
         pass
 from pathlib import Path
 
+import httpx
 import typer
 from jinja2 import TemplateError
 from pydantic import ValidationError
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
 from agentflow.defaults import (
     bundled_templates,
     bundled_template_names,
@@ -60,7 +68,7 @@ from agentflow.local_shell import (
     target_uses_login_bash,
 )
 from agentflow.prepared import resolve_local_workdir
-from agentflow.specs import AgentKind, LocalTarget, PipelineSpec, normalize_agent_name, provider_uses_kimi_anthropic_auth, resolve_provider
+from agentflow.specs import AgentKind, LocalTarget, PipelineSpec, RunRecord, normalize_agent_name, provider_uses_kimi_anthropic_auth, resolve_provider
 from agentflow.tuned_agents import list_tuned_agent_records, resolve_tuned_agent_version, run_evolution_from_payload
 
 app = typer.Typer(add_completion=False)
@@ -126,6 +134,149 @@ def _build_store(runs_dir: str) -> object:
     from agentflow.store import RunStore
 
     return RunStore(runs_dir)
+
+
+def _daemon_metadata_path(runs_dir: str) -> Path:
+    override = os.getenv("AGENTFLOW_DAEMON_METADATA_PATH")
+    if override:
+        return Path(override).expanduser().resolve()
+    return (Path(runs_dir).expanduser().resolve() / "daemon.json")
+
+
+def _resolve_daemon_host() -> str:
+    return os.getenv("AGENTFLOW_DAEMON_HOST", "127.0.0.1")
+
+
+def _resolve_daemon_port() -> int:
+    raw = os.getenv("AGENTFLOW_DAEMON_PORT", "8000")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise typer.BadParameter(f"`AGENTFLOW_DAEMON_PORT` must be an integer, got `{raw}`.") from exc
+
+
+def _daemon_base_url(host: str, port: int) -> str:
+    return f"http://{host}:{port}"
+
+
+def _load_daemon_metadata(metadata_path: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _write_daemon_metadata(metadata_path: Path, *, host: str, port: int, pid: int) -> None:
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"host": host, "port": port, "pid": pid}
+    temp_path = metadata_path.parent / f"{metadata_path.name}.tmp"
+    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path.replace(metadata_path)
+
+
+@contextmanager
+def _daemon_startup_lock(metadata_path: Path):
+    """Serialize daemon startup and metadata updates across local processes."""
+    lock_path = metadata_path.parent / f"{metadata_path.name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _daemon_is_healthy(base_url: str) -> bool:
+    try:
+        response = httpx.get(f"{base_url}/api/runs", timeout=0.5)
+    except httpx.RequestError:
+        return False
+    return response.status_code == 200
+
+
+def _start_daemon(*, host: str, port: int, runs_dir: str, max_concurrent_runs: int) -> subprocess.Popen:
+    command = [sys.executable, "-m", "agentflow.cli", "serve", "--host", host, "--port", str(port)]
+    env = dict(os.environ)
+    env["AGENTFLOW_RUNS_DIR"] = runs_dir
+    env["AGENTFLOW_MAX_CONCURRENT_RUNS"] = str(max_concurrent_runs)
+    return subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+
+
+def _wait_for_daemon(base_url: str, *, timeout_seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _daemon_is_healthy(base_url):
+            return
+        time.sleep(0.1)
+    typer.echo(
+        (
+            f"Timed out waiting for the daemon at {base_url} to become healthy. "
+            "Check whether that host/port is already in use, inspect daemon startup errors, "
+            "or try starting `agentflow serve` manually with the same --host/--port values."
+        ),
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
+def _ensure_daemon(
+    runs_dir: str,
+    max_concurrent_runs: int,
+    *,
+    host: str,
+    port: int,
+    metadata_path: Path,
+) -> str:
+    base_url = _daemon_base_url(host, port)
+    with _daemon_startup_lock(metadata_path):
+        metadata = _load_daemon_metadata(metadata_path)
+        metadata_host = metadata.get("host") if isinstance(metadata, dict) else None
+        metadata_port = metadata.get("port") if isinstance(metadata, dict) else None
+        if isinstance(metadata_host, str) and isinstance(metadata_port, int) and (metadata_host, metadata_port) == (host, port):
+            metadata_base_url = _daemon_base_url(metadata_host, metadata_port)
+            if _daemon_is_healthy(metadata_base_url):
+                return metadata_base_url
+
+        process = _start_daemon(host=host, port=port, runs_dir=runs_dir, max_concurrent_runs=max_concurrent_runs)
+        _wait_for_daemon(base_url)
+        _write_daemon_metadata(metadata_path, host=host, port=port, pid=process.pid)
+        return base_url
+
+
+def _submit_detached_run(pipeline: object, base_url: str) -> RunRecord:
+    payload: dict[str, object] = {"pipeline": pipeline.model_dump(mode="json")}
+    base_dir = getattr(pipeline, "base_dir", None)
+    if isinstance(base_dir, str) and base_dir:
+        payload["base_dir"] = base_dir
+    try:
+        response = httpx.post(f"{base_url}/api/runs", json=payload, timeout=10.0)
+    except httpx.RequestError as exc:
+        typer.echo(f"Failed to submit run to daemon at {base_url}: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text.strip()
+        typer.echo(f"Failed to submit run to daemon at {base_url}: {detail}", err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        data = response.json()
+    except ValueError as exc:
+        typer.echo(f"Failed to submit run to daemon at {base_url}: invalid JSON response", err=True)
+        raise typer.Exit(code=1) from exc
+    return RunRecord.model_validate(data)
 
 
 def _render_tuned_agents_summary(records: list[object]) -> str:
@@ -453,6 +604,315 @@ def _build_run_summary(record: object, run_dir: Path | str | None = None) -> dic
     return summary
 
 
+_STATUS_INACTIVE_NODE_STATUSES = {"pending", "queued", "ready"}
+_STATUS_ACTIVE_NODE_STATUSES = {"running", "retrying", "cancelling"}
+_EVOLUTION_PROGRESS_KEYS = {"agentflow_event", "stage", "attempt", "status", "command", "detail", "node_id"}
+_EVOLUTION_PROGRESS_PREVIEW_LIMIT = 5
+
+
+def _normalize_event_payload(event: object) -> dict[str, object]:
+    if isinstance(event, dict):
+        payload = dict(event)
+    else:
+        model_dump = getattr(event, "model_dump", None)
+        if callable(model_dump):
+            payload = model_dump(mode="json")
+        else:
+            payload = {
+                "timestamp": getattr(event, "timestamp", None),
+                "run_id": getattr(event, "run_id", None),
+                "type": getattr(event, "type", None),
+                "node_id": getattr(event, "node_id", None),
+                "data": getattr(event, "data", None),
+            }
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        payload["data"] = {}
+    return payload
+
+
+def _event_data_summary(data: object) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    pieces: list[str] = []
+    if data.get("status") is not None:
+        pieces.append(f"status={data['status']}")
+    if data.get("attempt") is not None:
+        pieces.append(f"attempt={data['attempt']}")
+    if data.get("round_number") is not None:
+        pieces.append(f"round={data['round_number']}")
+    if data.get("total_rounds") is not None:
+        pieces.append(f"of={data['total_rounds']}")
+    if data.get("child_run_id") is not None:
+        pieces.append(f"child={data['child_run_id']}")
+    if data.get("reason") is not None:
+        pieces.append(f"reason={data['reason']}")
+    if data.get("error") is not None:
+        pieces.append(f"error={data['error']}")
+    return " ".join(pieces) if pieces else None
+
+
+def _render_status_event(event_payload: dict[str, object]) -> str:
+    timestamp = event_payload.get("timestamp")
+    event_type = event_payload.get("type")
+    node_id = event_payload.get("node_id")
+    parts: list[str] = []
+    if timestamp:
+        parts.append(str(timestamp))
+    if event_type:
+        parts.append(str(event_type))
+    if node_id:
+        parts.append(f"node={node_id}")
+    detail = _event_data_summary(event_payload.get("data"))
+    if detail:
+        parts.append(detail)
+    return " ".join(parts)
+
+
+def _parse_evolution_progress_line(line: str) -> dict[str, object] | None:
+    try:
+        payload = json.loads(line)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("agentflow_event") != "evolution_progress":
+        return None
+    stage = payload.get("stage")
+    attempt = payload.get("attempt")
+    if not stage or attempt is None:
+        return None
+    return {key: payload[key] for key in _EVOLUTION_PROGRESS_KEYS if key in payload}
+
+
+def _build_status_evolution_progress(record: object, events: list[object]) -> list[dict[str, object]]:
+    nodes: dict[str, object] = getattr(record, "nodes", {}) or {}
+    parsed_events: list[dict[str, object]] = []
+    for node_id, node in nodes.items():
+        for line in getattr(node, "stderr_lines", []) or []:
+            if not isinstance(line, str):
+                continue
+            event = _parse_evolution_progress_line(line)
+            if event:
+                event["node_id"] = node_id
+                parsed_events.append(event)
+
+    for event in events:
+        payload = _normalize_event_payload(event)
+        if payload.get("type") != "node_trace":
+            continue
+        node_id = payload.get("node_id")
+        if not isinstance(node_id, str) or not node_id:
+            continue
+        trace = payload.get("data", {}).get("trace")
+        if not isinstance(trace, dict):
+            continue
+        if trace.get("source") != "stderr":
+            continue
+        content = trace.get("content")
+        if not isinstance(content, str):
+            continue
+        parsed = _parse_evolution_progress_line(content)
+        if parsed is None:
+            continue
+        parsed["node_id"] = node_id
+        parsed_events.append(parsed)
+
+    deduped: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for event in parsed_events:
+        key = json.dumps(event, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(event)
+    return deduped
+
+
+def _render_evolution_progress(event: dict[str, object]) -> str:
+    node_id = event.get("node_id") or "-"
+    stage = event.get("stage") or "-"
+    status = event.get("status")
+    label = f"{stage} {status}" if status else str(stage)
+    pieces: list[str] = []
+    attempt = event.get("attempt")
+    if attempt is not None:
+        pieces.append(f"attempt {attempt}")
+    command = event.get("command")
+    if command:
+        pieces.append(f"command={command}")
+    detail = event.get("detail")
+    if detail:
+        pieces.append(f"detail={detail}")
+    if not pieces:
+        return f"{node_id}: {label}"
+    return f"{node_id}: {label} ({', '.join(pieces)})"
+
+
+def _build_status_progress(record: object) -> dict[str, object]:
+    nodes: dict[str, object] = getattr(record, "nodes", {}) or {}
+    pipeline_nodes = _pipeline_node_map(record)
+    node_ids = list(pipeline_nodes) if pipeline_nodes else list(nodes)
+    total_nodes = len(node_ids)
+    status_counts: dict[str, int] = {}
+    progressed_nodes = 0
+    active_nodes: list[dict[str, object]] = []
+
+    for node_id in node_ids:
+        node = nodes.get(node_id)
+        status = _status_value(getattr(node, "status", "pending")).lower()
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status not in _STATUS_INACTIVE_NODE_STATUSES:
+            progressed_nodes += 1
+        if status in _STATUS_ACTIVE_NODE_STATUSES:
+            entry: dict[str, object] = {"id": node_id, "status": status}
+            attempt = _node_attempt_count(node) if node is not None else 0
+            if attempt:
+                entry["attempt"] = attempt
+            active_nodes.append(entry)
+
+    progress_percent = 0.0
+    if total_nodes:
+        progress_percent = max(0.0, min(100.0, (progressed_nodes / total_nodes) * 100))
+
+    return {
+        "total_nodes": total_nodes,
+        "progressed_nodes": progressed_nodes,
+        "active_nodes": active_nodes,
+        "status_counts": status_counts,
+        "progress_percent": progress_percent,
+    }
+
+
+def _build_status_optimization(record: object) -> dict[str, object] | None:
+    payload: dict[str, object] = {}
+    parent_run_id = getattr(record, "optimization_parent_run_id", None)
+    if parent_run_id:
+        payload["parent_run_id"] = parent_run_id
+    round_number = getattr(record, "optimization_round", None)
+    if round_number:
+        payload["round"] = round_number
+    session = getattr(record, "optimization_session", None)
+    if isinstance(session, dict) and session:
+        payload["session"] = session
+    return payload or None
+
+
+def _build_status_summary(
+    record: object,
+    events: list[object],
+    *,
+    run_dir: Path | str | None = None,
+) -> dict[str, object]:
+    summary = _build_run_summary(record, run_dir=run_dir)
+    normalized_events = [_normalize_event_payload(event) for event in events]
+    summary["events"] = normalized_events
+    summary["recent_events"] = normalized_events[-5:]
+    summary["progress"] = _build_status_progress(record)
+    summary["evolution_progress"] = _build_status_evolution_progress(record, events)
+    optimization = _build_status_optimization(record)
+    if optimization is not None:
+        summary["optimization"] = optimization
+    return summary
+
+
+def _render_status_optimization(optimization: dict[str, object]) -> str | None:
+    session = optimization.get("session")
+    pieces: list[str] = []
+    if isinstance(session, dict):
+        kind = session.get("kind")
+        if kind:
+            pieces.append(str(kind))
+        optimizer = session.get("optimizer")
+        if optimizer:
+            pieces.append(f"optimizer={optimizer}")
+        current_round = session.get("current_round")
+        total_rounds = session.get("total_rounds")
+        if current_round and total_rounds:
+            pieces.append(f"round {current_round}/{total_rounds}")
+        elif current_round:
+            pieces.append(f"round {current_round}")
+        child_run_ids = session.get("child_run_ids")
+        if isinstance(child_run_ids, list):
+            pieces.append(f"child_runs={len(child_run_ids)}")
+    if "round" in optimization and not any(piece.startswith("round ") for piece in pieces):
+        pieces.append(f"round {optimization['round']}")
+    if optimization.get("parent_run_id"):
+        pieces.append(f"parent={optimization['parent_run_id']}")
+    if not pieces:
+        return None
+    return f"Optimization: {' '.join(pieces)}"
+
+
+def _render_status_summary(
+    record: object,
+    events: list[object],
+    *,
+    run_dir: Path | str | None = None,
+) -> str:
+    summary = _build_status_summary(record, events, run_dir=run_dir)
+    lines = [f"Run {summary['id']}: {summary['status']}"]
+    pipeline = summary.get("pipeline")
+    if isinstance(pipeline, dict) and pipeline.get("name"):
+        lines.append(f"Pipeline: {pipeline['name']}")
+    duration = summary.get("duration")
+    if duration is not None:
+        lines.append(f"Duration: {duration}")
+    started_at = summary.get("started_at")
+    if started_at:
+        lines.append(f"Started: {started_at}")
+    run_dir_value = summary.get("run_dir")
+    if run_dir_value is not None:
+        lines.append(f"Run dir: {run_dir_value}")
+    optimization = summary.get("optimization")
+    if isinstance(optimization, dict):
+        rendered = _render_status_optimization(optimization)
+        if rendered:
+            lines.append(rendered)
+
+    progress = summary.get("progress")
+    if isinstance(progress, dict):
+        total_nodes = progress.get("total_nodes", 0)
+        progressed_nodes = progress.get("progressed_nodes", 0)
+        active_nodes = progress.get("active_nodes", [])
+        if total_nodes:
+            lines.append(f"Progress: {progressed_nodes}/{total_nodes} nodes, active {len(active_nodes)}")
+        if isinstance(active_nodes, list) and active_nodes:
+            active_entries: list[str] = []
+            for node in active_nodes:
+                node_id = node.get("id")
+                status = node.get("status")
+                if not node_id or not status:
+                    continue
+                rendered = f"{node_id} ({status}"
+                attempt = node.get("attempt")
+                if attempt:
+                    rendered += f", attempt {attempt}"
+                rendered += ")"
+                active_entries.append(rendered)
+            if active_entries:
+                lines.append(f"Active: {', '.join(active_entries)}")
+
+    evolution_progress = summary.get("evolution_progress")
+    if isinstance(evolution_progress, list) and evolution_progress:
+        lines.append("Evolution progress:")
+        for event in evolution_progress[-_EVOLUTION_PROGRESS_PREVIEW_LIMIT:]:
+            if not isinstance(event, dict):
+                continue
+            lines.append(f"- {_render_evolution_progress(event)}")
+
+    recent_events = summary.get("recent_events")
+    if isinstance(recent_events, list) and recent_events:
+        lines.append("Recent events:")
+        for event_payload in recent_events:
+            if not isinstance(event_payload, dict):
+                continue
+            lines.append(f"- {_render_status_event(event_payload)}")
+    return "\n".join(lines)
+
+
 def _render_run_summary(record: object, run_dir: Path | str | None = None) -> str:
     summary = _build_run_summary(record, run_dir=run_dir)
     lines = [f"Run {summary['id']}: {summary['status']}"]
@@ -518,6 +978,27 @@ def _echo_run_result(record: object, *, output: RunOutputFormat, run_dir: Path |
         typer.echo(json.dumps(_build_run_summary(record, run_dir=run_dir), indent=2))
         return
     typer.echo(json.dumps(record.model_dump(mode="json"), indent=2))
+
+
+def _echo_status_result(
+    record: object,
+    events: list[object],
+    *,
+    output: RunOutputFormat,
+    run_dir: Path | str | None = None,
+) -> None:
+    resolved_output = _resolve_run_output(output)
+    if resolved_output == RunOutputFormat.SUMMARY:
+        typer.echo(_render_status_summary(record, events, run_dir=run_dir))
+        return
+    if resolved_output == RunOutputFormat.JSON_SUMMARY:
+        typer.echo(json.dumps(_build_status_summary(record, events, run_dir=run_dir), indent=2))
+        return
+    model_dump = getattr(record, "model_dump", None)
+    if callable(model_dump):
+        typer.echo(json.dumps(model_dump(mode="json"), indent=2))
+        return
+    typer.echo(json.dumps(_build_run_summary(record, run_dir=run_dir), indent=2))
 
 
 def _run_dir_for_record(store: object | None, run_id: str) -> Path | str | None:
@@ -2184,6 +2665,25 @@ def show(
 
 
 @app.command()
+def status(
+    run_id: str,
+    runs_dir: str = typer.Option(".agentflow/runs", envvar="AGENTFLOW_RUNS_DIR"),
+    output: RunOutputFormat = typer.Option(
+        RunOutputFormat.AUTO,
+        "--output",
+        help="Result output format. Defaults to `summary` on a terminal and `json` otherwise.",
+    ),
+) -> None:
+    store = _build_store(runs_dir)
+    record = _get_run_or_exit(store, run_id, runs_dir=runs_dir)
+    events = []
+    get_events = getattr(store, "get_events", None)
+    if callable(get_events):
+        events = get_events(run_id)
+    _echo_status_result(record, events, output=output, run_dir=_run_dir_for_record(store, run_id))
+
+
+@app.command()
 def cancel(
     run_id: str,
     runs_dir: str = typer.Option(".agentflow/runs", envvar="AGENTFLOW_RUNS_DIR"),
@@ -2536,6 +3036,12 @@ def run(
     path: str,
     runs_dir: str = typer.Option(".agentflow/runs", envvar="AGENTFLOW_RUNS_DIR"),
     max_concurrent_runs: int = typer.Option(2, envvar="AGENTFLOW_MAX_CONCURRENT_RUNS"),
+    detach: bool = typer.Option(
+        False,
+        "--detach",
+        "-d",
+        help="Submit the run to the local daemon and exit without waiting for completion.",
+    ),
     output: RunOutputFormat = typer.Option(
         RunOutputFormat.AUTO,
         "--output",
@@ -2559,6 +3065,20 @@ def run(
         output,
         show_preflight=show_preflight,
     )
+    if detach:
+        host = _resolve_daemon_host()
+        port = _resolve_daemon_port()
+        metadata_path = _daemon_metadata_path(runs_dir)
+        base_url = _ensure_daemon(
+            runs_dir,
+            max_concurrent_runs,
+            host=host,
+            port=port,
+            metadata_path=metadata_path,
+        )
+        record = _submit_detached_run(pipeline, base_url)
+        _echo_run_result(record, output=output)
+        raise typer.Exit(code=0)
     _run_pipeline(pipeline, runs_dir, max_concurrent_runs, output)
 
 

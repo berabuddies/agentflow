@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 from pathlib import Path
 
 import agentflow.cli
@@ -13,7 +12,7 @@ from agentflow.inspection import build_launch_inspection
 from agentflow.orchestrator import Orchestrator
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.registry import RunnerRegistry
-from agentflow.specs import AgentKind, NodeSpec, PipelineSpec, RepoInstructionsMode, RunRecord, RunStatus
+from agentflow.specs import AgentKind, NodeSpec, PipelineSpec, RunRecord, RunStatus
 from agentflow.store import RunStore
 from agentflow.tuned_agents import (
     CommandExecution,
@@ -22,10 +21,7 @@ from agentflow.tuned_agents import (
     list_tuned_agent_records,
     load_tuner_config,
     load_tuned_agent_registry,
-    _execution_paths,
     _optimizer_prompt,
-    _run_optimizer,
-    _run_prepared,
     register_tuned_agent_version,
     ResolvedTunerConfig,
     TunerConfig,
@@ -47,138 +43,6 @@ class SimpleCodexAdapter(AgentAdapter):
             cwd=paths.target_workdir,
             trace_kind="codex",
         )
-
-
-def test_run_prepared_closes_stdin_when_none(monkeypatch):
-    captured: dict[str, object] = {}
-
-    def fake_run(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return subprocess.CompletedProcess(args[0], 0, "", "")
-
-    monkeypatch.setattr("agentflow.tuned_agents.subprocess.run", fake_run)
-
-    prepared = PreparedExecution(
-        command=["echo", "hi"],
-        env={},
-        cwd=".",
-        trace_kind="codex",
-        stdin=None,
-    )
-
-    _run_prepared(prepared)
-
-    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
-
-
-def test_run_optimizer_ignores_repo_instructions(monkeypatch, tmp_path):
-    captured: dict[str, object] = {}
-
-    class FakeAdapter(AgentAdapter):
-        def prepare(self, node, prompt: str, paths: ExecutionPaths) -> PreparedExecution:
-            captured["node"] = node
-            return PreparedExecution(
-                command=["echo", "optimizer"],
-                env={},
-                cwd=str(tmp_path),
-                trace_kind="codex",
-            )
-
-    def fake_get(_agent):
-        return FakeAdapter()
-
-    def fake_paths(repo_dir: Path, runtime_dir: Path) -> ExecutionPaths:
-        return ExecutionPaths(
-            host_workdir=repo_dir,
-            host_runtime_dir=runtime_dir,
-            target_workdir=str(repo_dir),
-            target_runtime_dir=str(runtime_dir),
-            app_root=repo_dir,
-        )
-
-    def fake_materialize(*_args, **_kwargs) -> None:
-        return None
-
-    def fake_run_prepared(_prepared: PreparedExecution) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(["echo"], 0, "", "")
-
-    monkeypatch.setattr("agentflow.tuned_agents.default_adapter_registry.get", fake_get)
-    monkeypatch.setattr("agentflow.tuned_agents._execution_paths", fake_paths)
-    monkeypatch.setattr("agentflow.tuned_agents._materialize_runtime_files", fake_materialize)
-    monkeypatch.setattr("agentflow.tuned_agents._run_prepared", fake_run_prepared)
-
-    _run_optimizer(
-        AgentKind.CODEX,
-        prompt="optimize",
-        repo_dir=tmp_path / "repo",
-        runtime_dir=tmp_path / "runtime",
-        env={},
-    )
-
-    assert captured["node"].repo_instructions_mode == RepoInstructionsMode.IGNORE
-
-
-def test_run_optimizer_uses_openai_provider_when_base_url_is_present(monkeypatch, tmp_path):
-    captured: dict[str, object] = {}
-
-    class FakeAdapter(AgentAdapter):
-        def prepare(self, node, prompt: str, paths: ExecutionPaths) -> PreparedExecution:
-            captured["node"] = node
-            return PreparedExecution(
-                command=["echo", "optimizer"],
-                env={},
-                cwd=str(tmp_path),
-                trace_kind="codex",
-            )
-
-    def fake_get(_agent):
-        return FakeAdapter()
-
-    def fake_paths(repo_dir: Path, runtime_dir: Path) -> ExecutionPaths:
-        return ExecutionPaths(
-            host_workdir=repo_dir,
-            host_runtime_dir=runtime_dir,
-            target_workdir=str(repo_dir),
-            target_runtime_dir=str(runtime_dir),
-            app_root=repo_dir,
-        )
-
-    def fake_materialize(*_args, **_kwargs) -> None:
-        return None
-
-    def fake_run_prepared(_prepared: PreparedExecution) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(["echo"], 0, "", "")
-
-    monkeypatch.setattr("agentflow.tuned_agents.default_adapter_registry.get", fake_get)
-    monkeypatch.setattr("agentflow.tuned_agents._execution_paths", fake_paths)
-    monkeypatch.setattr("agentflow.tuned_agents._materialize_runtime_files", fake_materialize)
-    monkeypatch.setattr("agentflow.tuned_agents._run_prepared", fake_run_prepared)
-
-    _run_optimizer(
-        AgentKind.CODEX,
-        prompt="optimize",
-        repo_dir=tmp_path / "repo",
-        runtime_dir=tmp_path / "runtime",
-        env={"AGENTFLOW_OPENAI_BASE_URL": "http://relay.example/openai"},
-    )
-
-    assert captured["node"].provider is not None
-    assert captured["node"].provider.name == "openai-custom"
-    assert captured["node"].provider.base_url == "http://relay.example/openai"
-    assert captured["node"].provider.wire_api == "responses"
-    assert captured["node"].env["OPENAI_BASE_URL"] == "http://relay.example/openai"
-
-
-def test_execution_paths_resolve_relative_inputs(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-
-    paths = _execution_paths(Path("repo"), Path("runtime"))
-
-    assert paths.target_workdir == str(tmp_path / "repo")
-    assert paths.target_runtime_dir == str(tmp_path / "runtime")
-    assert Path(paths.target_workdir).is_absolute()
-    assert Path(paths.target_runtime_dir).is_absolute()
 
 
 def test_loader_supports_yaml_pipeline(tmp_path):
@@ -218,6 +82,8 @@ def test_evolve_helper_filters_source_nodes_and_builds_payload():
     assert evolve_node["depends_on"] == ["plan"]
     assert '"source_nodes": ["plan"]' in evolve_node["prompt"]
     assert "{{ nodes.plan.artifacts.trace_jsonl }}" in evolve_node["prompt"]
+    assert "sys.path.insert(0," in evolve_node["prompt"]
+    assert "progress=_evolution_progress" in evolve_node["prompt"]
 
 
 def test_resolve_node_for_execution_uses_latest_registry_entry(tmp_path):
@@ -383,7 +249,7 @@ def test_run_evolution_from_payload_retries_and_registers_latest(tmp_path, monke
     assert Path(result["executable"]).exists()
 
 
-def test_run_evolution_from_payload_uses_repo_root_for_optimizer_when_workdir_subpath_is_set(tmp_path, monkeypatch):
+def test_run_evolution_from_payload_reports_progress(tmp_path, monkeypatch):
     workspace = tmp_path
     config_dir = workspace / "agent_tuner"
     config_dir.mkdir()
@@ -393,29 +259,28 @@ def test_run_evolution_from_payload_uses_repo_root_for_optimizer_when_workdir_su
                 "name: codex_tuned",
                 "base_agent: codex",
                 "repo_url: https://example.invalid/repo.git",
-                "workdir_subpath: codex-rs",
                 "build_command: build",
                 "test_command: test",
                 "smoke_command: smoke",
                 "evolution_prompt: improve the agent",
-                "executable_path: target/debug/codex",
-                "max_attempts: 1",
+                "executable_path: .venv/bin/codex",
+                "max_attempts: 2",
             ]
         ),
         encoding="utf-8",
     )
     trace_path = workspace / "trace.jsonl"
     trace_path.write_text('{"kind":"assistant_message","content":"hello"}\n', encoding="utf-8")
-    captured: dict[str, object] = {}
 
     def fake_clone(_config, repo_dir: Path) -> None:
-        (repo_dir / "codex-rs").mkdir(parents=True)
-        (repo_dir / "README.md").write_text("root", encoding="utf-8")
-        (repo_dir / "codex-rs" / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+        repo_dir.mkdir(parents=True)
+        (repo_dir / "README.md").write_text("base", encoding="utf-8")
+
+    attempt_state = {"smoke": 0}
 
     def fake_optimizer(_optimizer: AgentKind, *, prompt: str, repo_dir: Path, runtime_dir: Path, env: dict[str, str]):
-        captured["optimizer_repo_dir"] = str(repo_dir)
-        captured["optimizer_prompt"] = prompt
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        (repo_dir / "README.md").write_text(prompt, encoding="utf-8")
         return CommandExecution(
             command="optimizer",
             exit_code=0,
@@ -424,16 +289,24 @@ def test_run_evolution_from_payload_uses_repo_root_for_optimizer_when_workdir_su
         )
 
     def fake_shell(command_template: str, *, repo_dir: Path, version_dir: Path, traces_dir: Path, executable: str, env: dict[str, str]):
-        captured.setdefault("shell_repo_dirs", []).append(str(repo_dir))
         if command_template == "build":
             executable_path = Path(executable)
             executable_path.parent.mkdir(parents=True, exist_ok=True)
             executable_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        if command_template == "smoke":
+            attempt_state["smoke"] += 1
+            if attempt_state["smoke"] == 1:
+                return CommandExecution(command="smoke", exit_code=1, stdout="", stderr="ping failed")
         return CommandExecution(command=command_template, exit_code=0, stdout="ok", stderr="")
 
     monkeypatch.setattr("agentflow.tuned_agents._clone_repo", fake_clone)
     monkeypatch.setattr("agentflow.tuned_agents._run_optimizer", fake_optimizer)
     monkeypatch.setattr("agentflow.tuned_agents._run_shell_command", fake_shell)
+
+    progress: list[dict[str, object]] = []
+
+    def capture(event: dict[str, object]) -> None:
+        progress.append(event)
 
     result = run_evolution_from_payload(
         {
@@ -443,13 +316,30 @@ def test_run_evolution_from_payload_uses_repo_root_for_optimizer_when_workdir_su
             "source_nodes": ["plan"],
             "trace_paths": {"plan": str(trace_path)},
             "workspace_dir": str(workspace),
-            "run_id": "run123",
-        }
+            "run_id": "run-progress",
+        },
+        progress=capture,
     )
 
-    assert captured["optimizer_repo_dir"] == result["repo_path"]
-    assert result["workdir"] == str(Path(result["repo_path"]) / "codex-rs")
-    assert captured["shell_repo_dirs"] == [result["workdir"], result["workdir"], result["workdir"]]
+    assert result["ok"] is True
+    assert any(event.get("agentflow_event") == "evolution_progress" for event in progress)
+    stages = [(event.get("stage"), event.get("status"), event.get("attempt")) for event in progress]
+    assert stages[0][0] == "start"
+    assert ("attempt", "started", 1) in stages
+    assert ("optimizer", "started", 1) in stages
+    assert ("optimizer", "completed", 1) in stages
+    assert ("build", "started", 1) in stages
+    assert ("build", "completed", 1) in stages
+    assert ("test", "started", 1) in stages
+    assert ("test", "completed", 1) in stages
+    assert ("smoke", "started", 1) in stages
+    assert ("smoke", "failed", 1) in stages
+    assert ("attempt", "started", 2) in stages
+    assert ("final", "success", 2) in stages
+    smoke_failure = next(event for event in progress if event.get("stage") == "smoke" and event.get("status") == "failed")
+    assert "Smoke" in str(smoke_failure.get("detail", ""))
+    build_start = next(event for event in progress if event.get("stage") == "build" and event.get("status") == "started")
+    assert build_start.get("command") == "build"
 
 
 def test_optimizer_prompt_explicitly_allows_prompt_and_tool_edits(tmp_path):
@@ -477,8 +367,7 @@ def test_optimizer_prompt_explicitly_allows_prompt_and_tool_edits(tmp_path):
 
     prompt = _optimizer_prompt(
         resolved,
-        repo_root=tmp_path / "repo",
-        repo_workdir=tmp_path / "repo",
+        repo_dir=tmp_path / "repo",
         traces_dir=tmp_path / "traces",
         source_nodes=["plan"],
         previous_failure=None,
@@ -490,9 +379,6 @@ def test_optimizer_prompt_explicitly_allows_prompt_and_tool_edits(tmp_path):
     assert "Known tunable surfaces and implementing files" in prompt
     assert "core/gpt_5_codex_prompt.md" in prompt
     assert "tools/src/local_tool.rs" in prompt
-    assert "Do not write design docs, implementation plans, or other planning artifacts" in prompt
-    assert "Do not wait for user confirmation" in prompt
-    assert "Ignore installed process skills such as brainstorming, writing-plans, systematic-debugging, and test-driven-development" in prompt
 
 
 def test_repo_includes_codex_tuner_profile():
@@ -505,19 +391,11 @@ def test_repo_includes_codex_tuner_profile():
     assert resolved.config.repo_url == "https://github.com/openai/codex.git"
     assert resolved.config.workdir_subpath == "codex-rs"
     assert resolved.config.executable_path == "target/debug/codex"
-    assert resolved.config.env["AGENTFLOW_CODEX_SANDBOX_MODE"] == "danger-full-access"
     assert "System prompts" in resolved.config.evolution_prompt
     assert "tool descriptions" in resolved.config.evolution_prompt
     assert len(resolved.config.tunable_surfaces) >= 10
-    # The first surface must be the real BASE_INSTRUCTIONS prompt that gets
-    # baked into the binary via `include_str!` in models-manager — not the
-    # legacy `core/gpt_5_codex_prompt.md` documentation files which never made
-    # it into the compiled binary.
-    # The primary surface is now the agentflow-side wrapper file, because
-    # gateway-proxied model providers can override server-side prompts and the
-    # wrapper is concatenated into the user message by agentflow before invoke.
-    assert resolved.config.tunable_surfaces[0].name.startswith("Agentflow-side prompt wrapper")
-    assert "codex-rs/agentflow_wrapper.md" in resolved.config.tunable_surfaces[0].paths
+    assert resolved.config.tunable_surfaces[0].name == "Base model prompts and prompt assembly"
+    assert "core/gpt_5_codex_prompt.md" in resolved.config.tunable_surfaces[0].paths
 
 
 def test_cli_lists_tuned_agents(tmp_path, capsys):
