@@ -3,6 +3,7 @@
 from agentflow.dsl import (
     DAG,
     Graph,
+    InferenceSetup,
     agent,
     claude,
     codex,
@@ -26,6 +27,7 @@ def create_app(*args, **kwargs):
 __all__ = [
     "DAG",
     "Graph",
+    "InferenceSetup",
     "agent",
     "claude",
     "codex",

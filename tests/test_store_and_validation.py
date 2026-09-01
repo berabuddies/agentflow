@@ -167,6 +167,47 @@ def test_pipeline_validation_rejects_empty_goal():
         )
 
 
+def test_pipeline_validation_accepts_graph_inference_setup():
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "graph-inference",
+            "working_dir": ".",
+            "inference": {
+                "gpu": "aws:8xb200@us-east-1",
+                "model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "engine": "vllm",
+            },
+            "nodes": [
+                {"id": "solve", "agent": "pi", "prompt": "solve"},
+            ],
+        }
+    )
+
+    assert pipeline.inference is not None
+    assert pipeline.inference.gpu == "aws:8xb200@us-east-1"
+    assert pipeline.inference.model == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert pipeline.inference.use_spot is True
+    assert pipeline.inference.port == 8000
+
+
+def test_pipeline_validation_rejects_invalid_graph_inference_setup():
+    with pytest.raises(ValidationError):
+        PipelineSpec.model_validate(
+            {
+                "name": "invalid-graph-inference",
+                "working_dir": ".",
+                "inference": {
+                    "gpu": "",
+                    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+                    "engine": "bad",
+                },
+                "nodes": [
+                    {"id": "solve", "agent": "pi", "prompt": "solve"},
+                ],
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("target_patch", "expected_field"),
     [

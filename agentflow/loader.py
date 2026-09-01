@@ -76,29 +76,71 @@ def _resolve_file_relative_paths(parsed: dict[str, Any], base_dir: Path) -> dict
         working_dir = working_dir.resolve()
         resolved["working_dir"] = str(working_dir)
 
-    def _resolve_local_target_payload(target: Any) -> Any:
-        if not isinstance(target, dict) or target.get("kind", "local") != "local":
+    def _resolve_target_payload(target: Any) -> Any:
+        if not isinstance(target, dict):
             return target
-        cwd = target.get("cwd")
-        if not isinstance(cwd, str) or not cwd:
+
+        kind = target.get("kind", "local")
+        if kind == "local":
+            cwd = target.get("cwd")
+            if not isinstance(cwd, str) or not cwd:
+                return target
+            expanded_cwd = Path(cwd).expanduser()
+            updated_target = dict(target)
+            if expanded_cwd.is_absolute():
+                updated_target["cwd"] = str(expanded_cwd.resolve())
+            else:
+                updated_target["cwd"] = str((working_dir / expanded_cwd).resolve())
+            return updated_target
+
+        if kind not in {"docker", "cloud_hypervisor"}:
             return target
-        expanded_cwd = Path(cwd).expanduser()
+
         updated_target = dict(target)
-        if expanded_cwd.is_absolute():
-            updated_target["cwd"] = str(expanded_cwd.resolve())
+        raw_mounts = updated_target.get("mounts")
+        if isinstance(raw_mounts, list):
+            resolved_mounts: list[Any] = []
+            for raw_mount in raw_mounts:
+                if not isinstance(raw_mount, dict):
+                    resolved_mounts.append(raw_mount)
+                    continue
+                mount = dict(raw_mount)
+                source = mount.get("source")
+                if isinstance(source, str) and source.strip():
+                    expanded_source = Path(source.strip()).expanduser()
+                    if not expanded_source.is_absolute():
+                        expanded_source = working_dir / expanded_source
+                    mount["source"] = str(expanded_source.resolve())
+                resolved_mounts.append(mount)
+            updated_target["mounts"] = resolved_mounts
+
+        if kind == "docker":
+            daemon_socket = updated_target.get("docker_daemon_socket")
+            if isinstance(daemon_socket, str) and daemon_socket.strip():
+                expanded_socket = Path(daemon_socket.strip()).expanduser()
+                updated_target["docker_daemon_socket"] = (
+                    str(expanded_socket.resolve()) if expanded_socket.is_absolute() else str(expanded_socket)
+                )
         else:
-            updated_target["cwd"] = str((working_dir / expanded_cwd).resolve())
+            for field_name in ("kernel", "rootfs"):
+                raw_path = updated_target.get(field_name)
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                expanded_path = Path(raw_path.strip()).expanduser()
+                if not expanded_path.is_absolute():
+                    expanded_path = working_dir / expanded_path
+                updated_target[field_name] = str(expanded_path.resolve())
         return updated_target
 
     local_target_defaults = resolved.get("local_target_defaults")
     if local_target_defaults is not None:
-        resolved["local_target_defaults"] = _resolve_local_target_payload(local_target_defaults)
+        resolved["local_target_defaults"] = _resolve_target_payload(local_target_defaults)
 
     node_defaults = resolved.get("node_defaults")
     if isinstance(node_defaults, dict):
         updated_node_defaults = dict(node_defaults)
         if "target" in updated_node_defaults:
-            updated_node_defaults["target"] = _resolve_local_target_payload(updated_node_defaults.get("target"))
+            updated_node_defaults["target"] = _resolve_target_payload(updated_node_defaults.get("target"))
         resolved["node_defaults"] = updated_node_defaults
 
     raw_agent_defaults = resolved.get("agent_defaults")
@@ -110,7 +152,7 @@ def _resolve_file_relative_paths(parsed: dict[str, Any], base_dir: Path) -> dict
                 continue
             updated_defaults = dict(defaults)
             if "target" in updated_defaults:
-                updated_defaults["target"] = _resolve_local_target_payload(updated_defaults.get("target"))
+                updated_defaults["target"] = _resolve_target_payload(updated_defaults.get("target"))
             updated_agent_defaults[agent_name] = updated_defaults
         resolved["agent_defaults"] = updated_agent_defaults
 
@@ -121,7 +163,7 @@ def _resolve_file_relative_paths(parsed: dict[str, Any], base_dir: Path) -> dict
             continue
         updated = dict(node)
         if "target" in updated:
-            updated["target"] = _resolve_local_target_payload(updated.get("target"))
+            updated["target"] = _resolve_target_payload(updated.get("target"))
         nodes.append(updated)
     resolved["nodes"] = nodes
     return resolved

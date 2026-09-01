@@ -15,6 +15,46 @@ from agentflow.specs import AgentKind, LocalTarget, NodeSpec, PipelineSpec, norm
 _CURRENT_GRAPH: ContextVar["Graph | None"] = ContextVar("_CURRENT_GRAPH", default=None)
 
 
+@dataclass(frozen=True, slots=True)
+class InferenceSetup:
+    """Graph-level OpenAI-compatible inference service launched via SkyPilot."""
+
+    gpu: str
+    model: str
+    engine: str = "vllm"
+    use_spot: bool = True
+    max_hourly_cost: float | None = None
+    image_id: str | None = None
+    name: str | None = None
+    cluster_name: str | None = None
+    api_key: str | None = None
+    port: int = 8000
+    idle_minutes_to_autostop: int = 60
+    retry_until_up: bool = False
+    endpoint_timeout_seconds: int = 600
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "gpu": self.gpu,
+            "model": self.model,
+            "engine": self.engine,
+            "use_spot": self.use_spot,
+            "port": self.port,
+            "idle_minutes_to_autostop": self.idle_minutes_to_autostop,
+            "retry_until_up": self.retry_until_up,
+            "endpoint_timeout_seconds": self.endpoint_timeout_seconds,
+        }
+        optional_fields = {
+            "max_hourly_cost": self.max_hourly_cost,
+            "image_id": self.image_id,
+            "name": self.name,
+            "cluster_name": self.cluster_name,
+            "api_key": self.api_key,
+        }
+        payload.update({key: value for key, value in optional_fields.items() if value is not None})
+        return payload
+
+
 @dataclass
 class _FailureEdge:
     """Proxy returned by ``node.on_failure`` for building back-edges."""
@@ -95,6 +135,7 @@ class Graph:
         node_defaults: dict[str, Any] | None = None,
         agent_defaults: dict[str | AgentKind, dict[str, Any]] | None = None,
         local_target_defaults: dict[str, Any] | LocalTarget | None = None,
+        inference: InferenceSetup | dict[str, Any] | None = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -109,6 +150,7 @@ class Graph:
         self.node_defaults = node_defaults
         self.agent_defaults = agent_defaults
         self.local_target_defaults = local_target_defaults
+        self.inference = inference
         self._nodes: dict[str, NodeBuilder] = {}
         self._token: Token[Graph | None] | None = None
 
@@ -154,6 +196,8 @@ class Graph:
             payload["agent_defaults"] = _normalize_agent_defaults(self.agent_defaults)
         if self.local_target_defaults is not None:
             payload["local_target_defaults"] = self.local_target_defaults
+        if self.inference is not None:
+            payload["inference"] = _normalize_inference_setup(self.inference)
         payload["nodes"] = [node.to_payload() for node in self._nodes.values()]
         return payload
 
@@ -185,6 +229,12 @@ def _normalize_node_defaults(defaults: dict[str, Any] | None) -> dict[str, Any] 
     if defaults is None:
         return None
     return _normalize_node_kwargs(defaults)
+
+
+def _normalize_inference_setup(value: InferenceSetup | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(value, InferenceSetup):
+        return value.to_payload()
+    return deepcopy(value)
 
 
 def _normalize_agent_defaults(

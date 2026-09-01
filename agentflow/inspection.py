@@ -7,9 +7,10 @@ from typing import Any
 
 from jinja2 import TemplateError
 
+from agentflow.agents.registry import AdapterRegistry, default_adapter_registry
+from agentflow.context import render_node_prompt
 from agentflow.doctor import build_bash_login_shell_bridge_recommendation
 from agentflow.local_shell import (
-    target_bash_login_startup_file_statuses,
     kimi_shell_init_requires_bash_warning,
     kimi_shell_init_requires_interactive_bash_warning,
     render_shell_init,
@@ -19,24 +20,35 @@ from agentflow.local_shell import (
     shell_init_exported_env_var_value,
     shell_init_exports_env_var,
     shell_init_uses_kimi_helper,
-    summarize_target_bash_login_startup,
-    target_uses_bash,
     shell_template_exported_env_var_value_before_command,
     shell_template_exports_env_var_before_command,
+    summarize_target_bash_login_startup,
     target_bash_home,
+    target_bash_login_startup_file_statuses,
     target_bash_login_startup_warning,
-    target_disables_bash_login_startup,
     target_bash_startup_exports_env_var,
+    target_disables_bash_login_startup,
+    target_uses_bash,
     target_uses_interactive_bash,
     target_uses_login_bash,
 )
-from agentflow.agents.registry import AdapterRegistry, default_adapter_registry
-from agentflow.context import render_node_prompt
 from agentflow.prepared import build_execution_paths
 from agentflow.runners.registry import RunnerRegistry, default_runner_registry
-from agentflow.specs import AgentKind, NodeResult, NodeSpec, NodeStatus, PipelineSpec, normalize_agent_name, resolve_execution_provider
+from agentflow.specs import (
+    AgentKind,
+    NodeResult,
+    NodeSpec,
+    NodeStatus,
+    PipelineSpec,
+    normalize_agent_name,
+    resolve_execution_provider,
+)
 from agentflow.tuned_agents import resolve_node_for_execution
-from agentflow.utils import looks_sensitive_key, redact_sensitive_shell_text, redact_sensitive_shell_value
+from agentflow.utils import (
+    looks_sensitive_key,
+    redact_sensitive_shell_text,
+    redact_sensitive_shell_value,
+)
 
 _REDACTED = "<redacted>"
 _GENERATED = "<generated>"
@@ -158,11 +170,17 @@ def _payload_summary(node_plan: dict[str, Any]) -> str | None:
     payload = launch.get("payload")
     if not isinstance(payload, dict):
         return None
-    if launch["kind"] == "container":
+    if launch["kind"] in ("container", "docker"):
         image = payload.get("image")
         engine = payload.get("engine")
         if image and engine:
             return f"{engine} image={image}"
+    if launch["kind"] == "cloud_hypervisor":
+        binary = payload.get("binary")
+        kernel = payload.get("kernel")
+        rootfs = payload.get("rootfs")
+        if binary and kernel and rootfs:
+            return f"{binary} kernel={kernel}, rootfs={rootfs}"
     if launch["kind"] in ("ec2", "ecs"):
         function_name = payload.get("function_name")
         invocation_type = payload.get("invocation_type")
@@ -312,8 +330,10 @@ def _auth_summary(
     launch_env: dict[str, str] | None = None,
     *,
     cwd: str | None = None,
+    prepared_env: dict[str, str] | None = None,
+    prepared_runtime_symlinks: dict[str, str] | None = None,
 ) -> str | None:
-    api_key_env, provider_name = _resolved_auth_requirement(node)
+    api_key_env, _provider_name = _resolved_auth_requirement(node)
     if not api_key_env:
         return None
 
@@ -388,6 +408,48 @@ def _auth_summary(
             api_key_env,
             ("`provider.env`", "provider.env"),
             helper_bootstrap_source,
+        )
+
+    isolated_kind = getattr(target, "kind", None)
+    if isolated_kind in {"docker", "cloud_hypervisor"}:
+        isolated_env = prepared_env or {}
+        target_name = "Docker" if isolated_kind == "docker" else "Cloud Hypervisor"
+        prepared_key = next(
+            (
+                key
+                for key in (
+                    api_key_env,
+                    "ANTHROPIC_API_KEY" if node.agent == AgentKind.CLAUDE else "",
+                    "KIMI_API_KEY" if node.agent == AgentKind.KIMI else "",
+                )
+                if key and _has_nonempty_env_value(isolated_env, key)
+            ),
+            None,
+        )
+        if prepared_key is not None:
+            if prepared_key == api_key_env:
+                return f"`{api_key_env}` via adapter-prepared {target_name} environment"
+            return (
+                f"`{prepared_key}` prepared for {target_name} from `{api_key_env}` by the "
+                f"{normalize_agent_name(node.agent)} adapter"
+            )
+
+        runtime_symlinks = prepared_runtime_symlinks or {}
+        inherits_codex_login = node.agent == AgentKind.CODEX and any(
+            Path(relative_path).as_posix().endswith("codex_home/auth.json")
+            for relative_path in runtime_symlinks
+        )
+        if inherits_codex_login:
+            return "Codex CLI login via `target.inherit_credentials`"
+
+        if node.agent == AgentKind.CODEX:
+            return (
+                f"{target_name} target expects `OPENAI_API_KEY` via `node.env`/`provider.env`, or a Codex CLI login "
+                "via `target.inherit_credentials`; current environment and host CLI homes are not inherited"
+            )
+        return (
+            f"{target_name} target expects `{api_key_env}` via `node.env` or `provider.env`; current environment "
+            "and host CLI homes are not inherited"
         )
 
     if str(os.getenv(api_key_env, "")).strip():
@@ -579,6 +641,47 @@ def _target_warnings(
     cwd: str | None = None,
 ) -> list[str]:
     warnings: list[str] = []
+
+    if target.get("kind") == "docker":
+        if target.get("mount_docker_daemon"):
+            warnings.append(
+                "Mounting the Docker daemon socket grants the container effective root-level control of "
+                "the Docker host and can bypass its mount and network policy."
+            )
+        if target.get("inherit_credentials"):
+            warnings.append(
+                "Docker credential inheritance exposes adapter-selected host credential/config files to the "
+                "container as read-only bind mounts."
+            )
+        if target.get("privileged"):
+            warnings.append(
+                "Privileged Docker execution disables most container isolation and can bypass its mount "
+                "and network policy."
+            )
+        network_policy = target.get("network_policy")
+        if isinstance(network_policy, dict) and network_policy.get("mode") == "host":
+            warnings.append(
+                "Docker host networking shares the host network namespace; the container can reach host-local "
+                "listeners and is not network-isolated."
+            )
+
+    if target.get("kind") == "cloud_hypervisor":
+        if target.get("seccomp") == "false":
+            warnings.append(
+                "Cloud Hypervisor seccomp filtering is disabled; the host-side VMM process has a broader "
+                "system-call attack surface."
+            )
+        if target.get("inherit_credentials"):
+            warnings.append(
+                "Cloud Hypervisor credential inheritance copies adapter-selected host credential/config files "
+                "into the VM's private runtime share."
+            )
+        network_policy = target.get("network_policy")
+        if isinstance(network_policy, dict) and network_policy.get("mode") == "tap":
+            warnings.append(
+                "Cloud Hypervisor TAP networking uses host-managed routing and firewall policy; the target "
+                "configuration is not a destination allowlist."
+            )
 
     effective_home = target_bash_home(target, env=launch_env, cwd=cwd)
 
@@ -935,6 +1038,11 @@ def _launch_env_inheritance_details(
     *,
     cwd: str | None = None,
 ) -> list[dict[str, Any]]:
+    # Isolated targets receive only variables in their prepared guest/container
+    # environment. The host launcher inheriting a variable does not forward it.
+    if getattr(node.target, "kind", None) in {"docker", "cloud_hypervisor"}:
+        return []
+
     key = _ambient_base_url_env_key(node)
     if key is None:
         return []
@@ -1048,7 +1156,11 @@ def build_launch_inspection(
                 "command_text": _command_text(prepared.command),
                 "cwd": prepared.cwd,
                 "trace_kind": prepared.trace_kind,
-                "env": _sanitize_env(prepared.env),
+                "env": (
+                    {key: _REDACTED for key in sorted(prepared.env)}
+                    if execution_node.target.kind in {"docker", "cloud_hypervisor"}
+                    else _sanitize_env(prepared.env)
+                ),
                 "env_keys": sorted(prepared.env),
                 "stdin": _preview_text(prepared.stdin, limit=120),
                 "runtime_files": sorted(prepared.runtime_files),
@@ -1066,7 +1178,14 @@ def build_launch_inspection(
             },
         }
         launch_env = _local_launch_env(node, resolved_provider)
-        auth_summary = _auth_summary(node, resolved_provider, launch_env, cwd=prepared.cwd)
+        auth_summary = _auth_summary(
+            node,
+            resolved_provider,
+            launch_env,
+            cwd=prepared.cwd,
+            prepared_env=prepared.env,
+            prepared_runtime_symlinks=prepared.runtime_symlinks,
+        )
         if auth_summary:
             node_plan["auth"] = auth_summary
         bootstrap_summary = _bootstrap_summary(node_plan["target"], prepared.env, cwd=prepared.cwd)

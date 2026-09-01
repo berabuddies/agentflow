@@ -6,6 +6,7 @@ import pytest
 
 from agentflow import (
     Graph,
+    InferenceSetup,
     claude,
     codex,
     fanout,
@@ -166,6 +167,40 @@ def test_graph_supports_optimizer_and_n_run():
     assert payload["n_run"] == 3
     assert spec.optimizer == "codex"
     assert spec.n_run == 3
+
+
+def test_graph_supports_inference_setup():
+    with Graph(
+        "my-pipeline",
+        concurrency=3,
+        inference=InferenceSetup(
+            gpu="aws:8x8xb200@us-east-2",
+            model="Qwen/Qwen2.5-0.5B-Instruct",
+            engine="sglang",
+            max_hourly_cost=20.0,
+        ),
+    ) as dag:
+        pi(task_id="solve", prompt="solve")
+
+    payload = dag.to_payload()
+    spec = dag.to_spec()
+
+    assert payload["concurrency"] == 3
+    assert payload["inference"] == {
+        "gpu": "aws:8x8xb200@us-east-2",
+        "model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "engine": "sglang",
+        "use_spot": True,
+        "port": 8000,
+        "idle_minutes_to_autostop": 60,
+        "retry_until_up": False,
+        "endpoint_timeout_seconds": 600,
+        "max_hourly_cost": 20.0,
+    }
+    assert spec.inference is not None
+    assert spec.inference.gpu == "aws:8x8xb200@us-east-2"
+    assert spec.inference.model == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert spec.inference.use_spot is True
 
 
 def test_airflow_like_dag_applies_local_target_defaults():

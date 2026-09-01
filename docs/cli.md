@@ -61,6 +61,83 @@ agentflow run examples/pipeline.yaml
 
 On a terminal, `run` and `inspect` default to a compact summary. When stdout is redirected, they fall back to JSON-oriented output. You can always force a format with `--output`.
 
+## Inference
+
+Launch a SkyPilot-backed OpenAI-compatible inference service with vLLM or SGLang:
+
+```bash
+agentflow inference Qwen/Qwen2.5-0.5B-Instruct --gpu aws:1xl4@us-east-1
+```
+
+By default, `agentflow inference` launches a reusable service and returns:
+
+- `base_url`: OpenAI-compatible `/v1` endpoint
+- `api_key`: bearer token configured on the remote server
+- `provider`: an AgentFlow `ProviderConfig` payload that can be pasted into a node
+
+Example provider use:
+
+```python
+from agentflow import Graph, pi
+
+provider = {
+    "name": "agentflow-inference-qwen",
+    "base_url": "https://example-endpoint/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "wire_api": "openai-completions",
+    "env": {
+        "OPENAI_API_KEY": "af-...",
+        "OPENAI_BASE_URL": "https://example-endpoint/v1",
+    },
+}
+
+with Graph("local-inference") as g:
+    pi(task_id="answer", prompt="Say hello.", model="Qwen/Qwen2.5-0.5B-Instruct", provider=provider)
+```
+
+For a pipeline-owned service, put `InferenceSetup` on the graph. The orchestrator
+launches the SkyPilot service once at run startup and injects the returned
+provider into PI nodes that do not already set `provider`:
+
+```python
+from agentflow import Graph, InferenceSetup, pi
+
+with Graph(
+    "my-pipeline",
+    concurrency=3,
+    inference=InferenceSetup(
+        gpu="aws:8x8xb200@us-east-2",
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        engine="sglang",
+    ),
+) as g:
+    pi(task_id="answer", prompt="Use the shared inference service.")
+```
+
+The `--gpu` selector is provider-aware but still maps to SkyPilot SDK resources:
+
+- `aws:8xb200@us-east-1` -> one AWS node in `us-east-1` with 8 B200 GPUs
+- `aws:8x8xb200@us-east-2` -> 8 AWS nodes in `us-east-2`, each with 8 B200 GPUs
+- `1xl4` -> let SkyPilot choose any supported cloud with one L4 GPU
+
+Spot/preemptible instances are used by default. Pass `--no-spot` to force on-demand capacity. For AWS B200 jobs, AgentFlow resolves the current Blackwell-capable AWS Deep Learning Base OSS NVIDIA-driver AMI from SSM per region unless `--image-id` is provided explicitly.
+
+For file-backed batches, use `--mode batch` and pass JSONL input with one `prompt` field per line:
+
+```bash
+agentflow inference meta-llama/Llama-3.1-8B-Instruct \
+  --mode batch \
+  --gpu aws:1xl4@us-east-1 \
+  --input prompts.jsonl \
+  --result-output /tmp/agentflow-inference/results.jsonl
+```
+
+Install the optional SkyPilot cloud stack when needed:
+
+```bash
+pip install -e '.[sky]'
+```
+
 ## Serve the local web UI
 
 Start the local web UI and API:

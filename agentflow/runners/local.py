@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
-from pathlib import Path
+from collections.abc import Awaitable
 from contextlib import suppress
+from pathlib import Path
 
 from agentflow.local_shell import render_shell_init, shell_wrapper_requires_command_placeholder, target_uses_interactive_bash
 from agentflow.prepared import ExecutionPaths, PreparedExecution
@@ -32,6 +33,7 @@ class LocalRunner(Runner):
         "bash: no job control in this shell",
     )
     _TERMINATE_GRACE_SECONDS = 1.0
+    _EXTERNAL_COMPLETION_GRACE_SECONDS = 1.0
     _SHELL_COMMAND_PLACEHOLDER_MESSAGE = (
         "`target.shell` already includes a shell command payload. Add `{command}` where AgentFlow should inject "
         "the prepared agent command."
@@ -242,11 +244,18 @@ class LocalRunner(Runner):
     async def _terminate_with_fallback(self, process, wait_task: asyncio.Task[int]) -> None:
         with suppress(ProcessLookupError):
             process.terminate()
-        if await self._wait_for_exit(wait_task, self._TERMINATE_GRACE_SECONDS):
-            return
-        with suppress(ProcessLookupError):
-            process.kill()
-        await self._wait_for_exit(wait_task, self._TERMINATE_GRACE_SECONDS)
+        if not await self._wait_for_exit(wait_task, self._TERMINATE_GRACE_SECONDS):
+            with suppress(ProcessLookupError):
+                process.kill()
+            await self._wait_for_exit(wait_task, self._TERMINATE_GRACE_SECONDS)
+
+        # asyncio exposes no public Process.close(). If descendants inherited a
+        # pipe, the transport otherwise survives after the direct child exits,
+        # delaying stream drain and warning when the event loop is later closed.
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            transport.close()
+            await asyncio.sleep(0)
 
     async def _consume_stream(self, node: NodeSpec, stream, stream_name: str, buffer: list[str], on_output: StreamCallback) -> None:
         while True:
@@ -258,6 +267,21 @@ class LocalRunner(Runner):
                 continue
             buffer.append(text)
             await on_output(stream_name, text)
+
+    def _external_completion(
+        self,
+        node: NodeSpec,
+        prepared: PreparedExecution,
+        paths: ExecutionPaths,
+    ) -> Awaitable[int] | None:
+        """Return an optional authoritative completion signal for the process.
+
+        Most local commands are complete when their subprocess exits. Runners
+        backed by another runtime can override this hook when that runtime has a
+        more authoritative lifecycle signal than its foreground client.
+        """
+
+        return None
 
     async def execute(
         self,
@@ -296,6 +320,13 @@ class LocalRunner(Runner):
         stdout_task = asyncio.create_task(self._consume_stream(node, process.stdout, "stdout", stdout_lines, on_output))
         stderr_task = asyncio.create_task(self._consume_stream(node, process.stderr, "stderr", stderr_lines, on_output))
         wait_task = asyncio.create_task(process.wait())
+        external_completion = self._external_completion(node, prepared, paths)
+        external_task = (
+            asyncio.ensure_future(external_completion)
+            if external_completion is not None
+            else None
+        )
+        external_exit_code: int | None = None
         timed_out = False
         cancelled = False
 
@@ -317,8 +348,11 @@ class LocalRunner(Runner):
                     cancelled = True
                     break
                 check_timeout = min(remaining or 1.0, 1.0)
+                monitored_tasks = {stdout_task, stderr_task, wait_task}
+                if external_task is not None:
+                    monitored_tasks.add(external_task)
                 done, _ = await asyncio.wait(
-                    {stdout_task, stderr_task, wait_task},
+                    monitored_tasks,
                     timeout=check_timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -326,12 +360,23 @@ class LocalRunner(Runner):
                     # Process exited — this is our primary completion signal.
                     # Don't wait for streams; child processes may hold pipes open.
                     break
+                if external_task is not None and external_task in done:
+                    external_exit_code = external_task.result()
+                    break
                 if stdout_task in done and stderr_task in done:
                     # Both streams EOF'd — process should follow shortly
                     if not wait_task.done():
-                        try:
-                            await asyncio.wait_for(wait_task, timeout=5)
-                        except asyncio.TimeoutError:
+                        completion_tasks = {wait_task}
+                        if external_task is not None:
+                            completion_tasks.add(external_task)
+                        completed, _ = await asyncio.wait(
+                            completion_tasks,
+                            timeout=5,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if external_task is not None and external_task in completed:
+                            external_exit_code = external_task.result()
+                        elif wait_task not in completed:
                             timed_out = True
                     break
         except Exception:
@@ -362,15 +407,32 @@ class LocalRunner(Runner):
             await _drain_streams()
             stderr_lines.append("Cancelled by user")
             await on_output("stderr", stderr_lines[-1])
+        elif external_exit_code is not None:
+            if not await self._wait_for_exit(
+                wait_task, self._EXTERNAL_COMPLETION_GRACE_SECONDS
+            ):
+                await self._terminate_with_fallback(process, wait_task)
+            await _drain_streams()
         else:
             await _drain_streams()
             if not wait_task.done():
                 await wait_task
 
+        if external_task is not None:
+            if not external_task.done():
+                external_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await external_task
+            elif external_exit_code is None:
+                with suppress(asyncio.CancelledError, Exception):
+                    external_task.result()
+
         if timed_out:
             exit_code = 124
         elif cancelled:
             exit_code = 130
+        elif external_exit_code is not None:
+            exit_code = external_exit_code
         else:
             exit_code = process.returncode if process.returncode is not None else 0
         return RawExecutionResult(

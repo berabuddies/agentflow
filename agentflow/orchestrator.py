@@ -40,11 +40,13 @@ from agentflow.loader import load_pipeline_from_path
 from agentflow.prepared import ExecutionPaths, PreparedExecution, build_execution_paths
 from agentflow.runners.registry import RunnerRegistry, default_runner_registry
 from agentflow.specs import (
+    AgentKind,
     NodeAttempt,
     NodeResult,
     NodeStatus,
     PeriodicActuationMode,
     PipelineSpec,
+    ProviderConfig,
     RunEvent,
     RunRecord,
     RunStatus,
@@ -183,6 +185,95 @@ class Orchestrator:
                             mgr.register_expected(sid, count)
                 except KeyError:
                     pass
+
+    async def _prepare_inference_service(self, run_id: str, record: RunRecord) -> None:
+        setup = record.pipeline.inference
+        if setup is None:
+            return
+
+        target_nodes = [
+            node
+            for node in record.pipeline.nodes
+            if builtin_agent_kind(node.agent) == AgentKind.PI and node.provider is None
+        ]
+        if not target_nodes:
+            await self._publish(
+                run_id,
+                "inference_skipped",
+                reason="no_pi_nodes_without_provider",
+            )
+            return
+
+        from agentflow import inference as inference_module
+
+        request = inference_module.SkyInferenceServiceRequest(
+            model_id=setup.model,
+            gpu=inference_module.parse_gpu_selector(setup.gpu),
+            engine=setup.engine,
+            use_spot=setup.use_spot,
+            max_hourly_cost=setup.max_hourly_cost,
+            image_id=setup.image_id,
+            name=setup.name,
+            cluster_name=setup.cluster_name,
+            api_key=setup.api_key,
+            port=setup.port,
+            idle_minutes_to_autostop=setup.idle_minutes_to_autostop,
+            retry_until_up=setup.retry_until_up,
+            endpoint_timeout_seconds=setup.endpoint_timeout_seconds,
+        )
+        await self._publish(
+            run_id,
+            "inference_starting",
+            model=setup.model,
+            gpu=setup.gpu,
+            engine=setup.engine,
+            use_spot=setup.use_spot,
+            target_nodes=[node.id for node in target_nodes],
+        )
+        service = await asyncio.to_thread(inference_module.launch_sky_inference_service, request)
+        provider = ProviderConfig.model_validate(service.provider)
+        default_model = f"{provider.name}/{setup.model}" if provider.name else setup.model
+
+        injected_nodes: list[str] = []
+        for node in target_nodes:
+            node.provider = provider
+            if node.model is None:
+                node.model = default_model
+            injected_nodes.append(node.id)
+
+        pi_defaults = record.pipeline.agent_defaults.setdefault(AgentKind.PI, {})
+        pi_defaults.setdefault("provider", provider.model_dump(mode="json"))
+        pi_defaults.setdefault("model", default_model)
+
+        await self._publish(
+            run_id,
+            "inference_ready",
+            name=service.name,
+            cluster_name=service.cluster_name,
+            base_url=service.base_url,
+            model=setup.model,
+            provider=self._sanitize_launch_value("provider", provider.model_dump(mode="json")),
+            injected_nodes=injected_nodes,
+        )
+        await self.store.persist_run(run_id)
+
+    async def _fail_inference_setup(self, run_id: str, exc: Exception) -> RunRecord:
+        record = self.store.get_run(run_id)
+        finished_at = utcnow_iso()
+        record.status = RunStatus.FAILED
+        record.finished_at = finished_at
+        for node_id, result in record.nodes.items():
+            if result.status in {NodeStatus.PENDING, NodeStatus.QUEUED, NodeStatus.READY}:
+                result.status = NodeStatus.SKIPPED
+                result.finished_at = finished_at
+                await self._publish(run_id, "node_skipped", node_id=node_id, reason="inference_setup_failed")
+        await self._publish(run_id, "inference_failed", error=str(exc))
+        await self._publish(run_id, "run_completed", status=record.status.value)
+        await self.store.clear_cancel_request(run_id)
+        await self.store.persist_run(run_id)
+        self._node_cancel_flags.pop(run_id, None)
+        self._pending_node_reruns.pop(run_id, None)
+        return record
 
     def _initialize_run_tracking(self, run_id: str, *, cancel_flag: threading.Event | None = None) -> None:
         self._cancel_flags[run_id] = cancel_flag or threading.Event()
@@ -1200,6 +1291,12 @@ class Orchestrator:
         record.started_at = utcnow_iso()
         await self._publish(run_id, "run_started", pipeline=pipeline.model_dump(mode="json"))
         await self.store.persist_run(run_id)
+        if not self._should_cancel(run_id):
+            try:
+                await self._prepare_inference_service(run_id, record)
+            except Exception as exc:  # noqa: BLE001 - fail the run before scheduling nodes.
+                return await self._fail_inference_setup(run_id, exc)
+            pipeline = record.pipeline
 
         node_map = pipeline.node_map
         iteration_counts: dict[tuple[str, str], int] = {}

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import shlex
-from typing import Any
 
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.specs import NodeSpec
@@ -16,7 +15,7 @@ class PythonAdapter:
         return PreparedExecution(
             command=["python3", "-c", prompt],
             env=dict(node.env or {}),
-            cwd=str(paths.host_workdir),
+            cwd=paths.target_workdir,
             trace_kind="python",
             runtime_files={},
             stdin=None,
@@ -30,7 +29,7 @@ class ShellAdapter:
         return PreparedExecution(
             command=["bash", "-c", prompt],
             env=dict(node.env or {}),
-            cwd=str(paths.host_workdir),
+            cwd=paths.target_workdir,
             trace_kind="shell",
             runtime_files={},
             stdin=None,
@@ -45,6 +44,11 @@ class SyncAdapter:
     """
 
     def prepare(self, node: NodeSpec, prompt: str, paths: ExecutionPaths) -> PreparedExecution:
+        if node.target.kind not in {"ssh", "ec2", "ecs"}:
+            raise ValueError(
+                "sync nodes require an `ssh`, `ec2`, or `ecs` target; container, Docker, and Cloud "
+                "Hypervisor targets already share the local pipeline workspace"
+            )
         mode = prompt.strip().lower()
         if mode not in ("repo", "full"):
             mode = "full"

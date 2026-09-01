@@ -344,11 +344,22 @@ class CodexAdapter(AgentAdapter):
 
         runtime_files: dict[str, str] = {}
         runtime_symlinks: dict[str, str] = {}
-        if provider or node.mcps or repo_instructions_ignored:
+        is_isolated_target = getattr(node.target, "kind", None) in {"docker", "cloud_hypervisor"}
+        inherit_host_credentials = not is_isolated_target or bool(
+            getattr(node.target, "inherit_credentials", False)
+        )
+        needs_scoped_home = bool(
+            provider
+            or node.mcps
+            or repo_instructions_ignored
+            or (is_isolated_target and inherit_host_credentials)
+        )
+        if needs_scoped_home:
             codex_home = str(Path(paths.target_runtime_dir) / "codex_home")
             host_config = Path.home() / ".codex" / "config.toml"
             inherit_host_config = (
-                provider is None
+                inherit_host_credentials
+                and provider is None
                 and not node.mcps
                 and host_config.is_file()
             )
@@ -361,7 +372,7 @@ class CodexAdapter(AgentAdapter):
                     sandbox,
                 )
             host_auth = Path.home() / ".codex" / "auth.json"
-            if host_auth.is_file():
+            if inherit_host_credentials and host_auth.is_file():
                 runtime_symlinks[self.relative_runtime_file("codex_home", "auth.json")] = str(host_auth)
             env["CODEX_HOME"] = codex_home
             env["HOME"] = codex_home

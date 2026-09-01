@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from copy import deepcopy
-import json
+import ipaddress
 import os
+import posixpath
 import re
 import shlex
 from collections import Counter
+from copy import deepcopy
 from datetime import datetime, timezone
+
 try:
     from enum import StrEnum
 except ImportError:  # pragma: no cover - Python < 3.11
@@ -15,7 +17,7 @@ except ImportError:  # pragma: no cover - Python < 3.11
     class StrEnum(str, Enum):
         pass
 from itertools import product
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
@@ -25,11 +27,11 @@ from agentflow.local_shell import (
     shell_init_commands,
     shell_init_uses_kimi_helper,
     shell_wrapper_requires_command_placeholder,
-    target_uses_bash,
-    target_uses_login_bash,
-    target_uses_interactive_bash,
     target_disables_bash_login_startup,
     target_disables_bash_rc_startup,
+    target_uses_bash,
+    target_uses_interactive_bash,
+    target_uses_login_bash,
 )
 
 
@@ -117,6 +119,40 @@ class ProviderConfig(BaseModel):
     wire_api: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
+
+
+class InferenceSetupSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    gpu: str
+    model: str
+    engine: Literal["vllm", "sglang"] = "vllm"
+    use_spot: bool = True
+    max_hourly_cost: float | None = Field(default=None, gt=0)
+    image_id: str | None = None
+    name: str | None = None
+    cluster_name: str | None = None
+    api_key: str | None = None
+    port: int = Field(default=8000, ge=1, le=65535)
+    idle_minutes_to_autostop: int = Field(default=60, ge=0)
+    retry_until_up: bool = False
+    endpoint_timeout_seconds: int = Field(default=600, ge=1)
+
+    @field_validator("gpu", "model")
+    @classmethod
+    def validate_required_text(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"`inference.{info.field_name}` must not be empty")
+        return normalized
+
+    @field_validator("image_id", "name", "cluster_name", "api_key")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 _KIMI_ANTHROPIC_BASE_URL = "https://api.kimi.com/coding/"
@@ -451,6 +487,808 @@ class ContainerTarget(BaseModel):
     entrypoint: str | None = None
 
 
+class DockerMount(BaseModel):
+    """An explicit host bind mount made available to a Docker target."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    target: str
+    read_only: bool = False
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("`target.mounts[].source` must not be empty")
+        if "\x00" in normalized or "," in normalized:
+            raise ValueError("`target.mounts[].source` must not contain NUL bytes or commas")
+        return normalized
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("`target.mounts[].target` must not be empty")
+        if not normalized.startswith("/"):
+            raise ValueError("`target.mounts[].target` must be an absolute container path")
+        if normalized.startswith("//"):
+            raise ValueError("`target.mounts[].target` must use a single leading slash")
+        if "\x00" in normalized or "," in normalized:
+            raise ValueError("`target.mounts[].target` must not contain NUL bytes or commas")
+        return posixpath.normpath(normalized)
+
+
+class DockerNetworkPolicy(BaseModel):
+    """Docker's native network attachment policy for an agent container.
+
+    ``custom`` attaches to a pre-created, user-managed Docker network. That is
+    the extension point for an egress proxy or firewall when callers need a
+    narrower policy than Docker's built-in bridge/host/none modes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["none", "bridge", "host", "custom"] = "bridge"
+    name: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    dns: list[str] = Field(default_factory=list)
+    add_hosts: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_shorthand(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            normalized = data.strip()
+            if not normalized:
+                raise ValueError("`target.network_policy` must not be empty")
+            if normalized in {"none", "bridge", "host"}:
+                return {"mode": normalized}
+            return {"mode": "custom", "name": normalized}
+        if isinstance(data, dict) and "network" in data and "name" not in data:
+            updated = dict(data)
+            updated["name"] = updated.pop("network")
+            return updated
+        return data
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if "\x00" in normalized or "," in normalized:
+            raise ValueError("`target.network_policy.name` must not contain NUL bytes or commas")
+        return normalized or None
+
+    @field_validator("aliases", "dns")
+    @classmethod
+    def validate_non_empty_list_entries(cls, value: list[str], info) -> list[str]:
+        normalized = [entry.strip() for entry in value]
+        if any(not entry for entry in normalized):
+            raise ValueError(f"`target.network_policy.{info.field_name}` entries must not be empty")
+        if any("\x00" in entry for entry in normalized):
+            raise ValueError(f"`target.network_policy.{info.field_name}` entries must not contain NUL bytes")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"`target.network_policy.{info.field_name}` entries must be unique")
+        return normalized
+
+    @field_validator("add_hosts")
+    @classmethod
+    def validate_add_hosts(cls, value: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for raw_host, raw_address in value.items():
+            host = raw_host.strip()
+            address = raw_address.strip()
+            if not host or not address:
+                raise ValueError("`target.network_policy.add_hosts` names and addresses must not be empty")
+            if any(character in host for character in ("\x00", ",", ":", "=")):
+                raise ValueError(
+                    "`target.network_policy.add_hosts` host names must not contain NUL, comma, colon, or equals"
+                )
+            if "\x00" in address or "," in address or "=" in address:
+                raise ValueError(
+                    "`target.network_policy.add_hosts` addresses must not contain NUL, comma, or equals"
+                )
+            if address != "host-gateway":
+                try:
+                    ipaddress.ip_address(address)
+                except ValueError as exc:
+                    raise ValueError(
+                        "`target.network_policy.add_hosts` addresses must be IP addresses or `host-gateway`"
+                    ) from exc
+            normalized[host] = address
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "DockerNetworkPolicy":
+        if self.mode == "custom":
+            if self.name is None:
+                raise ValueError("`target.network_policy.name` is required when mode is `custom`")
+            if self.name in {"none", "bridge", "host"} or self.name.startswith("container:"):
+                raise ValueError(
+                    "`target.network_policy.name` must identify a user-managed Docker network, "
+                    "not a built-in or container network mode"
+                )
+        elif self.name is not None:
+            raise ValueError("`target.network_policy.name` is only valid when mode is `custom`")
+        if self.aliases and self.mode != "custom":
+            raise ValueError("`target.network_policy.aliases` requires mode `custom`")
+        return self
+
+    @property
+    def docker_network(self) -> str:
+        return self.name if self.mode == "custom" and self.name is not None else self.mode
+
+
+_DOCKER_EXTRA_ARG_VALUE_OPTIONS = {
+    "--cpu-shares",
+    "--cpus",
+    "--cpuset-cpus",
+    "--hostname",
+    "--label",
+    "--log-driver",
+    "--log-opt",
+    "--memory",
+    "--memory-reservation",
+    "--memory-swap",
+    "--pids-limit",
+    "--platform",
+    "--pull",
+    "--shm-size",
+    "--stop-signal",
+    "--stop-timeout",
+    "--ulimit",
+}
+_DOCKER_EXTRA_ARG_BOOLEAN_OPTIONS = {
+    "--init",
+    "--oom-kill-disable",
+    "--read-only",
+}
+
+
+def _docker_container_paths_overlap(left: str, right: str) -> bool:
+    """Return whether either absolute container path contains the other."""
+
+    left_path = PurePosixPath(left)
+    right_path = PurePosixPath(right)
+    return left_path == right_path or left_path in right_path.parents or right_path in left_path.parents
+
+
+class DockerTarget(BaseModel):
+    """Run an agent in a local Docker container with explicit isolation controls."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["docker"] = "docker"
+    image: str = "agentflow-agents:latest"
+    engine: str = "docker"
+    workdir_mount: str = "/workspace"
+    runtime_mount: str = "/agentflow-runtime"
+    app_mount: str | None = None
+    workdir_read_only: bool = False
+    user: str | None = "host"
+    inherit_credentials: bool = False
+    mounts: list[DockerMount] = Field(default_factory=list)
+    network_policy: DockerNetworkPolicy = Field(default_factory=DockerNetworkPolicy)
+    privileged: bool = False
+    mount_docker_daemon: bool = False
+    docker_daemon_socket: str | None = None
+    dind: bool = False
+    extra_args: list[str] = Field(default_factory=list)
+    entrypoint: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_compatibility_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        updated = dict(data)
+        if "mount_docker_socket" in updated and "mount_docker_daemon" not in updated:
+            updated["mount_docker_daemon"] = updated.pop("mount_docker_socket")
+        if "network" in updated and "network_policy" not in updated:
+            updated["network_policy"] = updated.pop("network")
+        return updated
+
+    @field_validator("image", "engine")
+    @classmethod
+    def validate_required_text(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"`target.{info.field_name}` must not be empty")
+        if "\x00" in normalized:
+            raise ValueError(f"`target.{info.field_name}` must not contain NUL bytes")
+        if info.field_name == "image" and (
+            normalized.startswith("-") or any(character.isspace() for character in normalized)
+        ):
+            raise ValueError("`target.image` must be a Docker image reference, not a command-line option")
+        return normalized
+
+    @field_validator("workdir_mount", "runtime_mount")
+    @classmethod
+    def validate_required_container_path(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized.startswith("/"):
+            raise ValueError(f"`target.{info.field_name}` must be an absolute container path")
+        if normalized.startswith("//"):
+            raise ValueError(f"`target.{info.field_name}` must use a single leading slash")
+        if "\x00" in normalized or "," in normalized:
+            raise ValueError(f"`target.{info.field_name}` must not contain NUL bytes or commas")
+        return posixpath.normpath(normalized)
+
+    @field_validator("app_mount")
+    @classmethod
+    def validate_optional_container_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized.startswith("/"):
+            raise ValueError("`target.app_mount` must be an absolute container path or null")
+        if normalized.startswith("//"):
+            raise ValueError("`target.app_mount` must use a single leading slash")
+        if "\x00" in normalized or "," in normalized:
+            raise ValueError("`target.app_mount` must not contain NUL bytes or commas")
+        return posixpath.normpath(normalized)
+
+    @field_validator("entrypoint")
+    @classmethod
+    def normalize_entrypoint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("`target.entrypoint` must not be empty")
+        if "\x00" in normalized:
+            raise ValueError("`target.entrypoint` must not contain NUL bytes")
+        return normalized
+
+    @field_validator("user")
+    @classmethod
+    def normalize_user(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("`target.user` must be `host`, a Docker user/group value, or null")
+        if "\x00" in normalized or any(character.isspace() for character in normalized):
+            raise ValueError("`target.user` must not contain whitespace or NUL bytes")
+        return normalized
+
+    @field_validator("extra_args")
+    @classmethod
+    def validate_extra_args(cls, value: list[str]) -> list[str]:
+        normalized = [argument.strip() for argument in value]
+        if any(not argument for argument in normalized):
+            raise ValueError("`target.extra_args` entries must not be empty")
+        if any("\x00" in argument for argument in normalized):
+            raise ValueError("`target.extra_args` entries must not contain NUL bytes")
+
+        position = 0
+        while position < len(normalized):
+            argument = normalized[position]
+            option, separator, inline_value = argument.partition("=")
+            if option in _DOCKER_EXTRA_ARG_BOOLEAN_OPTIONS:
+                if separator and inline_value not in {"true", "false"}:
+                    raise ValueError(f"`target.extra_args` has an invalid boolean value for `{option}`")
+                position += 1
+                continue
+            if option not in _DOCKER_EXTRA_ARG_VALUE_OPTIONS:
+                if not argument.startswith("-"):
+                    raise ValueError(
+                        "`target.extra_args` cannot contain positional values; the Docker image is configured "
+                        "with `target.image`"
+                    )
+                raise ValueError(
+                    f"`target.extra_args` cannot set unsupported or isolation-sensitive option `{option}`"
+                )
+            if separator:
+                if not inline_value:
+                    raise ValueError(f"`target.extra_args` requires a value for `{option}`")
+                position += 1
+                continue
+            if position + 1 >= len(normalized):
+                raise ValueError(f"`target.extra_args` requires a value after `{option}`")
+            if not normalized[position + 1]:
+                raise ValueError(f"`target.extra_args` requires a non-empty value after `{option}`")
+            position += 2
+        return normalized
+
+    @field_validator("docker_daemon_socket")
+    @classmethod
+    def validate_docker_daemon_socket(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = str(Path(value.strip()).expanduser())
+        if not normalized or not Path(normalized).is_absolute():
+            raise ValueError("`target.docker_daemon_socket` must be an absolute host path")
+        if "\x00" in normalized or "," in normalized:
+            raise ValueError("`target.docker_daemon_socket` must not contain NUL bytes or commas")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_isolation_options(self) -> "DockerTarget":
+        if self.dind and not self.privileged:
+            raise ValueError("`target.dind: true` requires `target.privileged: true`")
+        if self.dind and self.mount_docker_daemon:
+            raise ValueError("`target.dind` and `target.mount_docker_daemon` are mutually exclusive")
+        if self.dind and self.entrypoint is not None:
+            raise ValueError(
+                "`target.entrypoint` cannot override the bundled image entrypoint when `target.dind` is enabled"
+            )
+        if self.dind and self.user not in {None, "host", "0", "0:0", "root", "root:root"}:
+            raise ValueError(
+                "`target.dind` supports `target.user: host` (drop to the invoking UID:GID after daemon "
+                "startup) or an explicit root/image-default user"
+            )
+        if self.dind and any(
+            argument.partition("=")[0] == "--read-only"
+            and (not argument.partition("=")[1] or argument.partition("=")[2] == "true")
+            for argument in self.extra_args
+        ):
+            raise ValueError("`target.dind` cannot be combined with `--read-only`")
+        if self.docker_daemon_socket is not None and not self.mount_docker_daemon:
+            raise ValueError(
+                "`target.docker_daemon_socket` requires `target.mount_docker_daemon: true`"
+            )
+
+        managed_targets = [self.workdir_mount, self.runtime_mount]
+        if self.app_mount is not None:
+            managed_targets.append(self.app_mount)
+
+        managed_overlaps = sorted(
+            (left, right)
+            for index, left in enumerate(managed_targets)
+            for right in managed_targets[index + 1 :]
+            if _docker_container_paths_overlap(left, right)
+        )
+        if managed_overlaps:
+            rendered = ", ".join(f"{left} <> {right}" for left, right in managed_overlaps)
+            raise ValueError(
+                "AgentFlow-managed Docker mount targets must not overlap as ancestors or descendants: "
+                + rendered
+            )
+        reserved_targets = {*managed_targets, "/var/run/docker.sock"}
+        mount_targets = [mount.target for mount in self.mounts]
+        duplicates = sorted(target for target, count in Counter(mount_targets).items() if count > 1)
+        if duplicates:
+            raise ValueError(f"duplicate Docker mount targets: {duplicates}")
+        mount_overlaps = sorted(
+            (left, right)
+            for index, left in enumerate(mount_targets)
+            for right in mount_targets[index + 1 :]
+            if left != right and _docker_container_paths_overlap(left, right)
+        )
+        if mount_overlaps:
+            rendered = ", ".join(f"{left} <> {right}" for left, right in mount_overlaps)
+            raise ValueError(
+                "`target.mounts` targets must not overlap as ancestors or descendants: " + rendered
+            )
+        collisions = sorted(
+            (mount_target, reserved_target)
+            for mount_target in mount_targets
+            for reserved_target in reserved_targets
+            if _docker_container_paths_overlap(mount_target, reserved_target)
+        )
+        if collisions:
+            rendered = ", ".join(
+                mount_target if mount_target == reserved_target else f"{mount_target} <> {reserved_target}"
+                for mount_target, reserved_target in collisions
+            )
+            raise ValueError(
+                "`target.mounts` cannot overlap AgentFlow-managed mount targets as ancestors or descendants: "
+                + rendered
+            )
+
+        return self
+
+
+class CloudHypervisorMount(BaseModel):
+    """A host directory shared with a Cloud Hypervisor guest through virtio-fs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    target: str
+    read_only: bool = True
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("`target.mounts[].source` must not be empty")
+        if "\x00" in normalized:
+            raise ValueError("`target.mounts[].source` must not contain NUL bytes")
+        return normalized
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.startswith("/"):
+            raise ValueError("`target.mounts[].target` must be an absolute guest path")
+        if normalized.startswith("//"):
+            raise ValueError("`target.mounts[].target` must use a single leading slash")
+        if "\x00" in normalized or "," in normalized:
+            raise ValueError(
+                "`target.mounts[].target` must not contain NUL bytes or commas"
+            )
+        return posixpath.normpath(normalized)
+
+
+class CloudHypervisorNetworkPolicy(BaseModel):
+    """Network attachment and guest configuration for a Cloud Hypervisor VM."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["none", "tap"] = "none"
+    tap: str | None = None
+    mac: str | None = None
+    host_ip: str | None = None
+    host_mask: str | None = None
+    dhcp: bool = False
+    guest_address: str | None = None
+    gateway: str | None = None
+    dns: list[str] = Field(default_factory=list)
+    num_queues: int = Field(default=2, ge=2, le=256)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_shorthand(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            normalized = data.strip()
+            if normalized == "none":
+                return {"mode": "none"}
+            if normalized == "tap":
+                return {
+                    "mode": "tap",
+                    "host_ip": "192.168.249.1",
+                    "host_mask": "255.255.255.0",
+                    "guest_address": "192.168.249.2/24",
+                    "gateway": "192.168.249.1",
+                }
+            if normalized:
+                return {"mode": "tap", "tap": normalized, "dhcp": True}
+            raise ValueError("`target.network_policy` must not be empty")
+        return data
+
+    @field_validator("tap")
+    @classmethod
+    def validate_tap(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", normalized):
+            raise ValueError(
+                "`target.network_policy.tap` must be a Linux interface name of at most 15 characters"
+            )
+        return normalized
+
+    @field_validator("mac")
+    @classmethod
+    def validate_mac(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", normalized):
+            raise ValueError(
+                "`target.network_policy.mac` must be a colon-separated MAC address"
+            )
+        return normalized
+
+    @field_validator("host_ip", "gateway")
+    @classmethod
+    def validate_ip_address(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        try:
+            address = ipaddress.ip_address(normalized)
+        except ValueError as exc:
+            raise ValueError(
+                f"`target.network_policy.{info.field_name}` must be an IP address"
+            ) from exc
+        if info.field_name == "host_ip" and address.version != 4:
+            raise ValueError("`target.network_policy.host_ip` must be an IPv4 address")
+        return str(address)
+
+    @field_validator("host_mask")
+    @classmethod
+    def validate_host_mask(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        try:
+            address = ipaddress.IPv4Address(normalized)
+            ipaddress.IPv4Network(f"0.0.0.0/{address}")
+        except ValueError as exc:
+            raise ValueError(
+                "`target.network_policy.host_mask` must be a contiguous IPv4 netmask"
+            ) from exc
+        return str(address)
+
+    @field_validator("guest_address")
+    @classmethod
+    def validate_guest_address(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        try:
+            address = ipaddress.ip_interface(normalized)
+        except ValueError as exc:
+            raise ValueError(
+                "`target.network_policy.guest_address` must be an IP interface in CIDR form"
+            ) from exc
+        return str(address)
+
+    @field_validator("dns")
+    @classmethod
+    def validate_dns(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for entry in value:
+            try:
+                normalized.append(str(ipaddress.ip_address(entry.strip())))
+            except ValueError as exc:
+                raise ValueError(
+                    "`target.network_policy.dns` entries must be IP addresses"
+                ) from exc
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("`target.network_policy.dns` entries must be unique")
+        return normalized
+
+    @field_validator("num_queues")
+    @classmethod
+    def validate_num_queues(cls, value: int) -> int:
+        if value % 2:
+            raise ValueError("`target.network_policy.num_queues` must be even")
+        return value
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> CloudHypervisorNetworkPolicy:
+        configured = any(
+            (
+                self.tap is not None,
+                self.mac is not None,
+                self.host_ip is not None,
+                self.host_mask is not None,
+                self.dhcp,
+                self.guest_address is not None,
+                self.gateway is not None,
+                bool(self.dns),
+                self.num_queues != 2,
+            )
+        )
+        if self.mode == "none" and configured:
+            raise ValueError(
+                "Cloud Hypervisor network settings require `target.network_policy.mode: tap`"
+            )
+        if (self.host_ip is None) != (self.host_mask is None):
+            raise ValueError("`host_ip` and `host_mask` must be configured together")
+        if self.dhcp and self.guest_address is not None:
+            raise ValueError("`dhcp` and `guest_address` are mutually exclusive")
+        if self.gateway is not None and self.guest_address is None:
+            raise ValueError("`gateway` requires a static `guest_address`")
+        if self.guest_address is not None and self.gateway is not None:
+            guest_version = ipaddress.ip_interface(self.guest_address).version
+            gateway_version = ipaddress.ip_address(self.gateway).version
+            if guest_version != gateway_version:
+                raise ValueError(
+                    "`guest_address` and `gateway` must use the same IP version"
+                )
+        if (
+            self.host_ip is not None
+            and self.guest_address is not None
+            and ipaddress.ip_interface(self.guest_address).version != 4
+        ):
+            raise ValueError(
+                "`host_ip` and `guest_address` must use the same IP version"
+            )
+        return self
+
+
+_CLOUD_HYPERVISOR_SYSTEM_PATHS = ("/dev", "/proc", "/run", "/sys")
+
+
+class CloudHypervisorTarget(BaseModel):
+    """Boot an ephemeral AgentFlow guest with Cloud Hypervisor and virtio-fs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["cloud_hypervisor"] = "cloud_hypervisor"
+    kernel: str
+    rootfs: str
+    binary: str = "cloud-hypervisor"
+    virtiofsd: str = "virtiofsd"
+    cpus: int = Field(default=2, ge=1, le=256)
+    memory_mib: int = Field(default=4096, ge=256)
+    workdir_mount: str = "/workspace"
+    runtime_mount: str = "/agentflow-runtime"
+    app_mount: str | None = None
+    workdir_read_only: bool = False
+    user: str | None = "host"
+    inherit_credentials: bool = False
+    mounts: list[CloudHypervisorMount] = Field(default_factory=list)
+    network_policy: CloudHypervisorNetworkPolicy = Field(
+        default_factory=CloudHypervisorNetworkPolicy
+    )
+    guest_agent_port: int = Field(default=4050, ge=1, le=65535)
+    vsock_cid: int | None = Field(default=None, ge=3, le=4_294_967_294)
+    boot_timeout_seconds: int = Field(default=60, ge=1, le=3600)
+    shutdown_timeout_seconds: float = Field(default=5.0, ge=0.1, le=60.0)
+    init_path: str = "/usr/local/bin/agentflow-cloud-hypervisor-init"
+    nss_wrapper_path: str | None = "/usr/lib/libnss_wrapper.so"
+    kernel_args: list[str] = Field(default_factory=list)
+    seccomp: Literal["true", "false", "log"] = "true"
+
+    @field_validator("kernel", "rootfs", "binary", "virtiofsd")
+    @classmethod
+    def validate_required_text(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"`target.{info.field_name}` must not be empty")
+        if "\x00" in normalized:
+            raise ValueError(f"`target.{info.field_name}` must not contain NUL bytes")
+        if (
+            info.field_name in {"binary", "virtiofsd"}
+            and "/" in normalized
+            and not Path(normalized).is_absolute()
+        ):
+            raise ValueError(
+                f"`target.{info.field_name}` must be a PATH executable name or an absolute host path"
+            )
+        return normalized
+
+    @field_validator("workdir_mount", "runtime_mount")
+    @classmethod
+    def validate_required_guest_path(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized.startswith("/"):
+            raise ValueError(
+                f"`target.{info.field_name}` must be an absolute guest path"
+            )
+        if normalized.startswith("//"):
+            raise ValueError(
+                f"`target.{info.field_name}` must use a single leading slash"
+            )
+        if "\x00" in normalized or "," in normalized:
+            raise ValueError(
+                f"`target.{info.field_name}` must not contain NUL bytes or commas"
+            )
+        if info.field_name == "runtime_mount" and any(
+            character in normalized for character in (":", "\r", "\n")
+        ):
+            raise ValueError(
+                "`target.runtime_mount` must not contain colons or line breaks because it is used in the guest passwd file"
+            )
+        return posixpath.normpath(normalized)
+
+    @field_validator("app_mount")
+    @classmethod
+    def validate_optional_guest_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized.startswith("/"):
+            raise ValueError(
+                "`target.app_mount` must be an absolute guest path or null"
+            )
+        if normalized.startswith("//"):
+            raise ValueError("`target.app_mount` must use a single leading slash")
+        if "\x00" in normalized or "," in normalized:
+            raise ValueError("`target.app_mount` must not contain NUL bytes or commas")
+        return posixpath.normpath(normalized)
+
+    @field_validator("init_path")
+    @classmethod
+    def validate_init_path(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.startswith("/") or normalized.startswith("//"):
+            raise ValueError("`target.init_path` must be an absolute guest path")
+        if "\x00" in normalized or any(character.isspace() for character in normalized):
+            raise ValueError(
+                "`target.init_path` must not contain whitespace or NUL bytes"
+            )
+        return posixpath.normpath(normalized)
+
+    @field_validator("nss_wrapper_path")
+    @classmethod
+    def validate_nss_wrapper_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized.startswith("/") or normalized.startswith("//"):
+            raise ValueError(
+                "`target.nss_wrapper_path` must be an absolute guest path or null"
+            )
+        if "\x00" in normalized or any(character.isspace() for character in normalized):
+            raise ValueError(
+                "`target.nss_wrapper_path` must not contain whitespace or NUL bytes"
+            )
+        return posixpath.normpath(normalized)
+
+    @field_validator("user")
+    @classmethod
+    def validate_user(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if normalized in {"host", "root", "0", "0:0"}:
+            return normalized
+        if not re.fullmatch(r"[0-9]+(?::[0-9]+)?", normalized):
+            raise ValueError(
+                "`target.user` must be `host`, `root`, a numeric UID[:GID], or null"
+            )
+        if any(int(identifier) > 4_294_967_294 for identifier in normalized.split(":")):
+            raise ValueError(
+                "`target.user` UID and GID must fit Linux 32-bit identifiers"
+            )
+        return normalized
+
+    @field_validator("kernel_args")
+    @classmethod
+    def validate_kernel_args(cls, value: list[str]) -> list[str]:
+        normalized = [argument.strip() for argument in value]
+        if any(not argument for argument in normalized):
+            raise ValueError("`target.kernel_args` entries must not be empty")
+        if any(
+            "\x00" in argument or any(character.isspace() for character in argument)
+            for argument in normalized
+        ):
+            raise ValueError(
+                "`target.kernel_args` entries must be single arguments without whitespace or NUL bytes"
+            )
+        protected_prefixes = (
+            "agentflow.guest_port=",
+            "init=",
+            "root=",
+            "rootflags=",
+            "rootfstype=",
+        )
+        if any(
+            argument in {"--", "ro", "rw"} or argument.startswith(protected_prefixes)
+            for argument in normalized
+        ):
+            raise ValueError(
+                "`target.kernel_args` cannot override AgentFlow's root filesystem or guest init"
+            )
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_mount_layout(self) -> CloudHypervisorTarget:
+        managed_targets = [self.workdir_mount, self.runtime_mount]
+        if self.app_mount is not None:
+            managed_targets.append(self.app_mount)
+
+        all_static_targets = [
+            *managed_targets,
+            *(mount.target for mount in self.mounts),
+        ]
+        for target in all_static_targets:
+            for system_path in _CLOUD_HYPERVISOR_SYSTEM_PATHS:
+                if _docker_container_paths_overlap(target, system_path):
+                    raise ValueError(
+                        f"Cloud Hypervisor guest mount target `{target}` overlaps reserved system path `{system_path}`"
+                    )
+
+        overlaps = sorted(
+            (left, right)
+            for index, left in enumerate(all_static_targets)
+            for right in all_static_targets[index + 1 :]
+            if _docker_container_paths_overlap(left, right)
+        )
+        if overlaps:
+            rendered = ", ".join(f"{left} <> {right}" for left, right in overlaps)
+            raise ValueError(
+                "Cloud Hypervisor guest mount targets must not overlap as ancestors or descendants: "
+                + rendered
+            )
+        return self
+
+
 class SSHTarget(BaseModel):
     """Remote execution via SSH."""
 
@@ -507,7 +1345,7 @@ class ECSTarget(BaseModel):
 
 
 TargetSpec = Annotated[
-    LocalTarget | ContainerTarget | SSHTarget | EC2Target | ECSTarget,
+    LocalTarget | ContainerTarget | DockerTarget | CloudHypervisorTarget | SSHTarget | EC2Target | ECSTarget,
     Field(discriminator="kind"),
 ]
 
@@ -1471,6 +2309,7 @@ class PipelineSpec(BaseModel):
     node_defaults: dict[str, Any] | None = None
     agent_defaults: dict[AgentKind, dict[str, Any]] = Field(default_factory=dict)
     local_target_defaults: LocalTarget | None = None
+    inference: InferenceSetupSpec | None = None
     fanouts: dict[str, list[str]] = Field(default_factory=dict)
     nodes: list[NodeSpec]
 

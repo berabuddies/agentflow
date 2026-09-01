@@ -8,9 +8,11 @@ from pathlib import Path
 
 import pytest
 
+import agentflow.inference
 from agentflow import Graph, codex
 from agentflow.agents.base import AgentAdapter
 from agentflow.agents.registry import AdapterRegistry
+from agentflow.inference import SkyInferenceService
 from agentflow.orchestrator import Orchestrator
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.registry import RunnerRegistry
@@ -66,6 +68,28 @@ else:
             env={},
             cwd=paths.target_workdir,
             trace_kind=node.agent.value,
+        )
+
+
+class ProviderEchoAdapter(AgentAdapter):
+    def prepare(self, node, prompt: str, paths: ExecutionPaths) -> PreparedExecution:
+        payload = {
+            "provider": node.provider.model_dump(mode="json") if hasattr(node.provider, "model_dump") else node.provider,
+            "model": node.model,
+        }
+        script = (
+            "import json, sys\n"
+            "text = sys.argv[1]\n"
+            "print(json.dumps({'type': 'message_end', 'message': {"
+            "'role': 'assistant', "
+            "'content': [{'type': 'text', 'text': text}]"
+            "}}))\n"
+        )
+        return PreparedExecution(
+            command=["python3", "-c", script, json.dumps(payload)],
+            env={},
+            cwd=paths.target_workdir,
+            trace_kind="pi",
         )
 
 
@@ -289,6 +313,74 @@ esac
 
     assert completed.status.value == "completed"
     assert "yes" in (completed.nodes["ask"].output or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_launches_graph_inference_and_injects_pi_provider(tmp_path: Path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _launch(request):
+        captured["request"] = request
+        return SkyInferenceService(
+            name="agentflow-inference-qwen",
+            cluster_name="agentflow-infer-qwen",
+            base_url="https://inference.example/v1",
+            api_key=request.api_key or "generated-key",
+            model_id=request.model_id,
+            engine=request.engine,
+            gpu=request.gpu,
+            port=request.port,
+            use_spot=request.use_spot,
+            request_id="request-1",
+            provider={
+                "name": "agentflow-inference-qwen",
+                "base_url": "https://inference.example/v1",
+                "api_key_env": "OPENAI_API_KEY",
+                "wire_api": "openai-completions",
+                "env": {
+                    "OPENAI_API_KEY": request.api_key or "generated-key",
+                    "OPENAI_BASE_URL": "https://inference.example/v1",
+                },
+            },
+        )
+
+    monkeypatch.setattr(agentflow.inference, "launch_sky_inference_service", _launch)
+    adapters = AdapterRegistry()
+    adapters.register(AgentKind.PI, ProviderEchoAdapter())
+    orchestrator = Orchestrator(store=RunStore(tmp_path / "runs"), adapters=adapters, runners=RunnerRegistry())
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "graph-inference",
+            "working_dir": str(tmp_path),
+            "inference": {
+                "gpu": "aws:8x8xb200@us-east-2",
+                "model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "engine": "sglang",
+                "api_key": "test-key",
+            },
+            "nodes": [
+                {"id": "solve", "agent": "pi", "prompt": "solve"},
+            ],
+        }
+    )
+
+    run = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(run.id, timeout=5)
+
+    request = captured["request"]
+    assert request.model_id == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert request.gpu.num_nodes == 8
+    assert request.gpu.accelerators == "B200:8"
+    assert request.engine == "sglang"
+    assert request.use_spot is True
+    assert request.api_key == "test-key"
+    assert completed.status.value == "completed"
+    output = json.loads(completed.nodes["solve"].output)
+    assert output["provider"]["name"] == "agentflow-inference-qwen"
+    assert output["provider"]["base_url"] == "https://inference.example/v1"
+    assert output["provider"]["env"]["OPENAI_API_KEY"] == "test-key"
+    assert output["model"] == "agentflow-inference-qwen/Qwen/Qwen2.5-0.5B-Instruct"
+    assert completed.pipeline.node_map["solve"].provider.base_url == "https://inference.example/v1"
 
 
 @pytest.mark.asyncio

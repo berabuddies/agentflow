@@ -52,7 +52,7 @@ def build_execution_paths(
         host_runtime_dir = ensure_dir(host_runtime_dir)
 
     app_root = Path(__file__).resolve().parents[1]
-    if node_target.kind == "container":
+    if node_target.kind in ("container", "docker", "cloud_hypervisor"):
         host_workdir = pipeline_workdir
         target_workdir = node_target.workdir_mount
         target_runtime_dir = node_target.runtime_mount
