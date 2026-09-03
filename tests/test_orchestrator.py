@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import agentflow.inference
+from agentflow import Graph, codex
 from agentflow.agents.base import AgentAdapter
 from agentflow.agents.registry import AdapterRegistry
 from agentflow.inference import SkyInferenceService
@@ -262,6 +263,56 @@ async def test_orchestrator_runs_parallel_and_templates_outputs(tmp_path: Path):
     beta_start = datetime.fromisoformat(beta.started_at)
     assert abs((alpha_start - beta_start).total_seconds()) < 0.15
     assert elapsed < 1.0
+
+
+@pytest.mark.asyncio
+async def test_graph_codex_goal_mode_answers_from_goal_thread(tmp_path: Path):
+    marker = tmp_path / "goal-set"
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        r'''#!/usr/bin/env bash
+
+case "${1:-}:${2:-}" in
+app-server:--listen)
+    read -r _
+    echo '{"id":1,"result":{}}'
+    read -r _
+    echo '{"id":2,"result":{"thread":{"id":"thread-123"}}}'
+    read -r _
+    touch "$FAKE_CODEX_GOAL_MARKER"
+    echo '{"id":3,"result":{}}'
+    ;;
+exec:resume)
+    if [[ -f "$FAKE_CODEX_GOAL_MARKER" && "${@: -1}" == "am i in /goal ? yes or no" ]]; then
+        echo '{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"yes"}]}}'
+    else
+        echo '{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"no"}]}}'
+    fi
+    ;;
+*)
+    exit 2
+    ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    orchestrator = Orchestrator(store=RunStore(tmp_path / "runs"), adapters=AdapterRegistry(), runners=RunnerRegistry())
+
+    with Graph("goal-mode", working_dir=str(tmp_path)) as graph:
+        codex(
+            task_id="ask",
+            prompt="am i in /goal ? yes or no",
+            goal=True,
+            executable=str(fake_codex),
+            env={"FAKE_CODEX_GOAL_MARKER": str(marker)},
+        )
+
+    run = await orchestrator.submit(graph.to_spec())
+    completed = await orchestrator.wait(run.id, timeout=5)
+
+    assert completed.status.value == "completed"
+    assert "yes" in (completed.nodes["ask"].output or "").lower()
 
 
 @pytest.mark.asyncio

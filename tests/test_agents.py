@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
 
 from agentflow.agents.claude import ClaudeAdapter
 from agentflow.agents.codex import CodexAdapter
 from agentflow.agents.kimi import KimiAdapter
 from agentflow.agents.pi import PiAdapter
 from agentflow.prepared import ExecutionPaths
-from agentflow.specs import NodeSpec
+from agentflow.specs import NodeSpec, RepoInstructionsMode
 
 import pytest
 
@@ -83,6 +85,180 @@ def test_codex_adapter_suppresses_unstable_feature_warning(tmp_path):
 
     assert prepared.command.count("-c") == 2
     assert 'suppress_unstable_features_warning=true' in prepared.command
+
+
+def test_codex_adapter_runs_prompt_through_native_goal_bootstrap(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "implement",
+            "agent": "codex",
+            "prompt": "Finish the migration and keep tests green.",
+            "goal": True,
+        }
+    )
+
+    prepared = CodexAdapter().prepare(node, "Finish the migration and keep tests green.", _paths(tmp_path))
+
+    assert prepared.command[:2] == ["python3", "-c"]
+    assert prepared.stdin is not None
+    payload = json.loads(prepared.stdin)
+    assert payload["objective"] == "Finish the migration and keep tests green."
+    assert payload["prompt"] == "Finish the migration and keep tests green."
+    assert payload["resume_args"][:5] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
+    assert "--enable" in payload["resume_args"]
+    assert payload["resume_args"][payload["resume_args"].index("--enable") + 1] == "goals"
+    assert "-c" in payload["resume_args"]
+    assert 'sandbox_mode="read-only"' in payload["resume_args"]
+
+
+def test_codex_adapter_combines_explicit_goal_with_prompt_context(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "repair",
+            "agent": "codex",
+            "prompt": "Use pytest after each change.",
+            "goal": "Repair the failing API tests.",
+        }
+    )
+
+    prepared = CodexAdapter().prepare(node, "Use pytest after each change.", _paths(tmp_path))
+
+    assert prepared.stdin is not None
+    payload = json.loads(prepared.stdin)
+    assert payload["objective"] == "Repair the failing API tests."
+    assert payload["prompt"] == "Use pytest after each change."
+
+
+def test_codex_goal_resume_preserves_custom_provider_and_model(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "repair",
+            "agent": "codex",
+            "prompt": "Use the custom provider.",
+            "goal": True,
+            "model": "gpt-custom",
+            "provider": {
+                "name": "openai-pinned",
+                "base_url": "http://example.test/v1",
+                "api_key_env": "OPENAI_API_KEY",
+                "wire_api": "responses",
+            },
+        }
+    )
+
+    prepared = CodexAdapter().prepare(node, "Use the custom provider.", _paths(tmp_path))
+
+    assert prepared.stdin is not None
+    payload = json.loads(prepared.stdin)
+    assert payload["thread_start"]["model"] == "gpt-custom"
+    assert payload["thread_start"]["modelProvider"] == "openai-pinned"
+    assert payload["thread_start"]["config"]["model_provider"] == "openai-pinned"
+    assert "--model" in payload["resume_args"]
+    assert payload["resume_args"][payload["resume_args"].index("--model") + 1] == "gpt-custom"
+    assert 'model_provider="openai-pinned"' in payload["resume_args"]
+
+
+def test_codex_goal_resume_preserves_ignored_instruction_workspace_root(tmp_path):
+    paths = _paths(tmp_path)
+    node = NodeSpec.model_validate(
+        {
+            "id": "repair",
+            "agent": "codex",
+            "prompt": "Work on the repo without loading repo instructions.",
+            "goal": True,
+            "repo_instructions_mode": RepoInstructionsMode.IGNORE,
+            "tools": "read_write",
+        }
+    )
+
+    prepared = CodexAdapter().prepare(node, "Work on the repo without loading repo instructions.", paths)
+
+    assert prepared.cwd == str(tmp_path / ".runtime")
+    assert prepared.stdin is not None
+    payload = json.loads(prepared.stdin)
+    expected_roots = [str(tmp_path)]
+    assert payload["thread_start"]["cwd"] == str(tmp_path / ".runtime")
+    assert payload["thread_start"]["config"]["features"]["plugins"] is False
+    assert payload["thread_start"]["config"]["sandbox_workspace_write"]["writable_roots"] == expected_roots
+    assert "--disable" in payload["resume_args"]
+    assert payload["resume_args"][payload["resume_args"].index("--disable") + 1] == "plugins"
+    assert "sandbox_workspace_write.writable_roots=" + json.dumps(expected_roots) in payload["resume_args"]
+
+
+def test_codex_goal_bootstrap_sets_native_thread_goal_then_resumes(tmp_path):
+    log_path = tmp_path / "codex-log.jsonl"
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+
+log_path = os.environ["FAKE_CODEX_LOG"]
+
+def log(payload):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")
+
+args = sys.argv[1:]
+if args[:2] == ["app-server", "--listen"]:
+    for line in sys.stdin:
+        request = json.loads(line)
+        log({"kind": "app-server", "method": request["method"], "params": request.get("params")})
+        if request["method"] == "initialize":
+            response = {"id": request["id"], "result": {"userAgent": "fake", "codexHome": "/tmp/fake", "platformFamily": "unix", "platformOs": "linux"}}
+        elif request["method"] == "thread/start":
+            response = {"id": request["id"], "result": {"thread": {"id": "thread-123"}}}
+        elif request["method"] == "thread/goal/set":
+            response = {"id": request["id"], "result": {"goal": {"threadId": "thread-123", "objective": request["params"]["objective"], "status": "active"}}}
+        else:
+            response = {"id": request["id"], "error": {"message": "unexpected"}}
+        print(json.dumps(response), flush=True)
+    raise SystemExit(0)
+
+if args[:2] == ["exec", "resume"]:
+    log({"kind": "resume", "args": args})
+    prompt = args[-1]
+    print(json.dumps({"type": "response.output_item.done", "item": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": prompt}]}}))
+    raise SystemExit(0)
+
+raise SystemExit(2)
+''',
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    node = NodeSpec.model_validate(
+        {
+            "id": "repair",
+            "agent": "codex",
+            "prompt": "Use pytest after each change.",
+            "goal": "Repair the failing API tests.",
+            "executable": str(fake_codex),
+        }
+    )
+    prepared = CodexAdapter().prepare(node, "Use pytest after each change.", _paths(tmp_path))
+
+    result = subprocess.run(
+        prepared.command,
+        input=prepared.stdin,
+        text=True,
+        capture_output=True,
+        env={**os.environ, **prepared.env, "FAKE_CODEX_LOG": str(log_path)},
+        cwd=prepared.cwd,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [entry["method"] for entry in log_entries if entry["kind"] == "app-server"] == [
+        "initialize",
+        "thread/start",
+        "thread/goal/set",
+    ]
+    goal_set = [entry for entry in log_entries if entry.get("method") == "thread/goal/set"][0]
+    assert goal_set["params"]["objective"] == "Repair the failing API tests."
+    resume = [entry for entry in log_entries if entry["kind"] == "resume"][0]
+    assert resume["args"][-2:] == ["thread-123", "Use pytest after each change."]
 
 
 def test_codex_adapter_allows_env_override_for_sandbox_mode(tmp_path):

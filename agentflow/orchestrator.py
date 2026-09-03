@@ -1030,6 +1030,7 @@ class Orchestrator:
                         on_failure_restart=execution_node.on_failure_restart,
                         fanout_dependencies=getattr(execution_node, 'fanout_dependencies', {}),
                         executable=execution_node.executable,
+                        goal=execution_node.goal,
                         description=execution_node.description,
                         repo_instructions_mode=execution_node.repo_instructions_mode,
                     )

@@ -40,6 +40,24 @@ print(g.to_json())
 agentflow run pipeline.py --output summary
 ```
 
+## Codex Goal Mode
+
+Codex nodes can run through Codex's native Goal mode, the same thread goal
+state managed by `/goal`:
+
+```python
+codex(
+    task_id="repair",
+    prompt="Repair the failing API tests. Run pytest after each change.",
+    tools="read_write",
+    goal=True,
+)
+```
+
+`goal=True` uses the rendered prompt as the objective. You can also pass
+`goal="Repair the API test failures"` to set a shorter objective while the node
+prompt becomes the first turn in that goal thread.
+
 Or just ask Codex (the agentflow skill is auto-installed):
 
 ```bash

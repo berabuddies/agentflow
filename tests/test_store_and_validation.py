@@ -141,6 +141,32 @@ def test_pipeline_validation_rejects_codex_kimi_provider_alias():
         )
 
 
+def test_pipeline_validation_rejects_goal_on_non_codex_nodes():
+    with pytest.raises(ValueError, match="`goal` is only supported for codex nodes"):
+        PipelineSpec.model_validate(
+            {
+                "name": "invalid-goal-agent",
+                "working_dir": ".",
+                "nodes": [
+                    {"id": "review", "agent": "claude", "prompt": "review", "goal": True},
+                ],
+            }
+        )
+
+
+def test_pipeline_validation_rejects_empty_goal():
+    with pytest.raises(ValueError, match="`goal` must not be empty"):
+        PipelineSpec.model_validate(
+            {
+                "name": "invalid-empty-goal",
+                "working_dir": ".",
+                "nodes": [
+                    {"id": "plan", "agent": "codex", "prompt": "plan", "goal": "  "},
+                ],
+            }
+        )
+
+
 def test_pipeline_validation_accepts_graph_inference_setup():
     pipeline = PipelineSpec.model_validate(
         {

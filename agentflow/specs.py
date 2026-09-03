@@ -20,7 +20,7 @@ from itertools import product
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from agentflow.local_shell import (
     invalid_bash_long_option_error,
@@ -1630,6 +1630,7 @@ class NodeSpec(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     executable: str | None = None
     extra_args: list[str] = Field(default_factory=list)
+    goal: StrictBool | str = False
     description: str | None = None
     success_criteria: list[SuccessCriterion] = Field(default_factory=list)
     retries: int = Field(default=0, ge=0)
@@ -1662,6 +1663,12 @@ class NodeSpec(BaseModel):
                 raise ValueError("scheduled nodes cannot also use `fanout`")
             if self.target.kind != "local":
                 raise ValueError("scheduled nodes currently require a local target")
+        has_goal = bool(self.goal)
+        if isinstance(self.goal, str) and not self.goal.strip():
+            raise ValueError("`goal` must not be empty")
+        if has_goal:
+            if builtin_agent_kind(self.agent) != AgentKind.CODEX:
+                raise ValueError("`goal` is only supported for codex nodes")
         resolve_provider(self.provider, self.agent)
         return self
 

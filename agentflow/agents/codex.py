@@ -1,11 +1,104 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from agentflow.agents.base import AgentAdapter
 from agentflow.env import merge_env_layers
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.specs import NodeSpec, ProviderConfig, RepoInstructionsMode, ToolAccess
+
+
+_CODEX_GOAL_BOOTSTRAP_SCRIPT = r'''
+import json
+import os
+import select
+import subprocess
+import sys
+import time
+
+
+def fail(message):
+    print(message, file=sys.stderr, flush=True)
+    raise SystemExit(1)
+
+
+payload = json.load(sys.stdin)
+executable = payload["executable"]
+server = subprocess.Popen(
+    [executable, "app-server", "--listen", "stdio://", "--enable", "goals"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    env=os.environ.copy(),
+)
+next_id = 0
+
+
+def send(method, params):
+    global next_id
+    next_id += 1
+    request = {"jsonrpc": "2.0", "id": next_id, "method": method, "params": params}
+    assert server.stdin is not None
+    server.stdin.write(json.dumps(request) + "\n")
+    server.stdin.flush()
+    return next_id
+
+
+def read_response(request_id, timeout=30):
+    assert server.stdout is not None
+    assert server.stderr is not None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if server.poll() is not None:
+            fail(f"codex app-server exited before response {request_id}")
+        ready, _, _ = select.select([server.stdout, server.stderr], [], [], 0.2)
+        for stream in ready:
+            line = stream.readline()
+            if not line:
+                continue
+            if stream is server.stderr:
+                print(line.rstrip("\n"), file=sys.stderr, flush=True)
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                fail(f"codex app-server error for {request_id}: {message['error']}")
+            return message.get("result")
+    fail(f"timed out waiting for codex app-server response {request_id}")
+
+
+def stop_server():
+    if server.poll() is not None:
+        return
+    server.terminate()
+    try:
+        server.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        server.kill()
+        server.wait(timeout=3)
+
+
+try:
+    read_response(send("initialize", payload["initialize"]))
+    thread_result = read_response(send("thread/start", payload["thread_start"]))
+    thread_id = thread_result["thread"]["id"]
+    read_response(send("thread/goal/set", {
+        "threadId": thread_id,
+        "objective": payload["objective"],
+        "status": "active",
+    }))
+finally:
+    stop_server()
+
+resume_args = list(payload["resume_args"]) + [thread_id, payload["prompt"]]
+os.execvp(resume_args[0], resume_args)
+'''
 
 
 class CodexAdapter(AgentAdapter):
@@ -111,6 +204,95 @@ class CodexAdapter(AgentAdapter):
             return prompt
         return wrapper_text + self._WRAPPER_SEPARATOR + prompt
 
+    def _goal_payload(
+        self,
+        node: NodeSpec,
+        prompt: str,
+        *,
+        executable: str,
+        provider: ProviderConfig | None,
+        repo_instructions_ignored: bool,
+        sandbox: str,
+        target_workdir: str,
+        workspace_root: str | None,
+    ) -> dict[str, object] | None:
+        goal = getattr(node, "goal", False)
+        if not goal:
+            return None
+
+        if isinstance(goal, str):
+            objective = goal.strip()
+        else:
+            objective = prompt.strip()
+
+        resume_args = [
+            executable,
+            "exec",
+            "resume",
+            "--json",
+            "--skip-git-repo-check",
+            "-c",
+            'approval_policy="never"',
+            "-c",
+            "suppress_unstable_features_warning=true",
+            "--enable",
+            "goals",
+            "-c",
+            f"sandbox_mode={self._format_toml_value(sandbox)}",
+        ]
+        if node.model:
+            resume_args.extend(["--model", node.model])
+        if provider:
+            resume_args.extend(["-c", f"model_provider={self._format_toml_value(provider.name)}"])
+        if repo_instructions_ignored:
+            resume_args.extend(["--disable", "plugins"])
+            if workspace_root:
+                resume_args.extend(
+                    [
+                        "-c",
+                        "sandbox_workspace_write.writable_roots="
+                        + self._format_toml_value([workspace_root]),
+                    ]
+                )
+        resume_args.extend(node.extra_args)
+        features = {"goals": True}
+        if repo_instructions_ignored:
+            features["plugins"] = False
+        config: dict[str, object] = {
+            "features": features,
+            "suppress_unstable_features_warning": True,
+            "sandbox_mode": sandbox,
+        }
+        if provider:
+            config["model_provider"] = provider.name
+        if repo_instructions_ignored and workspace_root:
+            config["sandbox_workspace_write"] = {"writable_roots": [workspace_root]}
+
+        thread_start: dict[str, object] = {
+            "cwd": target_workdir,
+            "approvalPolicy": "never",
+            "sandbox": sandbox,
+            "config": config,
+            "threadSource": "user",
+            "sessionStartSource": "startup",
+        }
+        if node.model:
+            thread_start["model"] = node.model
+        if provider:
+            thread_start["modelProvider"] = provider.name
+
+        return {
+            "executable": executable,
+            "initialize": {
+                "clientInfo": {"name": "agentflow", "version": "0"},
+                "capabilities": None,
+            },
+            "thread_start": thread_start,
+            "objective": objective,
+            "prompt": prompt.strip() or objective,
+            "resume_args": resume_args,
+        }
+
     def prepare(self, node: NodeSpec, prompt: str, paths: ExecutionPaths) -> PreparedExecution:
         provider = self.provider_config(node.provider, node.agent)
         executable = node.executable or "codex"
@@ -129,6 +311,8 @@ class CodexAdapter(AgentAdapter):
             "--sandbox",
             sandbox,
         ]
+        if node.goal:
+            command.extend(["--enable", "goals"])
         if node.model and not provider:
             command.extend(["--model", node.model])
         if provider:
@@ -138,7 +322,25 @@ class CodexAdapter(AgentAdapter):
             command.extend(["--add-dir", paths.target_workdir])
         command.extend(node.extra_args)
         prompt = self._maybe_prepend_wrapper(node, prompt)
-        command.append(prompt)
+        cwd = paths.target_workdir
+        if repo_instructions_ignored:
+            cwd = str(Path(paths.target_runtime_dir))
+        goal_payload = self._goal_payload(
+            node,
+            prompt,
+            executable=executable,
+            provider=provider,
+            repo_instructions_ignored=repo_instructions_ignored,
+            sandbox=sandbox,
+            target_workdir=cwd,
+            workspace_root=paths.target_workdir if repo_instructions_ignored else None,
+        )
+        stdin = None
+        if goal_payload is not None:
+            command = ["python3", "-c", _CODEX_GOAL_BOOTSTRAP_SCRIPT]
+            stdin = json.dumps(goal_payload)
+        else:
+            command.append(prompt)
 
         runtime_files: dict[str, str] = {}
         runtime_symlinks: dict[str, str] = {}
@@ -174,9 +376,6 @@ class CodexAdapter(AgentAdapter):
                 runtime_symlinks[self.relative_runtime_file("codex_home", "auth.json")] = str(host_auth)
             env["CODEX_HOME"] = codex_home
             env["HOME"] = codex_home
-        cwd = paths.target_workdir
-        if repo_instructions_ignored:
-            cwd = str(Path(paths.target_runtime_dir))
         return PreparedExecution(
             command=command,
             env=env,
@@ -184,4 +383,5 @@ class CodexAdapter(AgentAdapter):
             trace_kind="codex",
             runtime_files=runtime_files,
             runtime_symlinks=runtime_symlinks,
+            stdin=stdin,
         )
